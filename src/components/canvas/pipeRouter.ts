@@ -193,13 +193,12 @@ const selectBestCardinalFaces = (
         const bend: Point = sIsVert ? { x: s.point.x, y: t.point.y } : { x: t.point.x, y: s.point.y };
 
         if (!isPointInsideNode(bend, source) && !isPointInsideNode(bend, target)) {
+          const legS = Math.abs(bend.x - s.point.x) + Math.abs(bend.y - s.point.y);
+          const legT = Math.abs(t.point.x - bend.x) + Math.abs(t.point.y - bend.y);
+          const fitsSocketLeads = legS >= MIN_SOCKET_LEAD && legT >= MIN_SOCKET_LEAD;
           const primaryMatch = sIsVert ? dy >= dx : dx >= dy;
-          const manhattanDist =
-            Math.abs(bend.x - s.point.x) +
-            Math.abs(bend.y - s.point.y) +
-            Math.abs(t.point.x - bend.x) +
-            Math.abs(t.point.y - bend.y);
-          score = 200 + (primaryMatch ? 30 : 0) - manhattanDist * 0.05;
+          const manhattanDist = legS + legT;
+          score = (fitsSocketLeads ? 200 : 40) + (primaryMatch ? 30 : 0) - manhattanDist * 0.05;
         }
       } else if (!sIsVert && !tIsVert) {
         if ((s.dir === 'E' && s.point.x < t.point.x) || (s.dir === 'W' && s.point.x > t.point.x)) {
@@ -1351,7 +1350,7 @@ export const computeAllLinkRoutes = (
       });
     });
 
-    const PERP_CLEAR_PAD = 10;
+    const PERP_CLEAR_PAD = 2;
     const STEM_PAD = 4;
 
     recordsByDir.forEach((group) => {
