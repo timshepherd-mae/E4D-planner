@@ -1,4 +1,4 @@
-import { ContainerNode, TransferLink, SimFrame, MaterialDefinition, RouteCorridor, Point, getLinkCorridorIds } from '../models/types';
+import { CardinalEdge, ContainerNode, TransferLink, SimFrame, MaterialDefinition, RouteCorridor, Point, getLinkCorridorIds } from '../models/types';
 import { SimEngine, OverflowMode, StrictSubRule } from '../simulation/SimEngine';
 
 export class CanvasViewModel {
@@ -272,6 +272,14 @@ export class CanvasViewModel {
     if (node) {
       Object.assign(node, updates);
       this.recalculateSimulation();
+    }
+  }
+
+  public setNodeOutputEdge(id: string, outputEdge?: CardinalEdge): void {
+    const node = this.nodes.find(n => n.id === id);
+    if (node) {
+      if (outputEdge) node.outputEdge = outputEdge;
+      else delete node.outputEdge;
     }
   }
 

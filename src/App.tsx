@@ -8,7 +8,8 @@ import { PropertyInspector } from './components/inspector/PropertyInspector';
 import { ExportModal } from './components/modal/ExportModal';
 import { RuleConfirmModal } from './components/modal/RuleConfirmModal';
 import { ManualModal } from './components/modal/ManualModal';
-import { ContainerNode, TransferLink, RouteCorridor, Point, OverflowMode, StrictSubRule, MaterialDefinition, ClipboardData, ContainerProperties, LinkProperties, getLinkCorridorIds } from './models/types';
+import { CardinalEdge, ContainerNode, TransferLink, RouteCorridor, Point, OverflowMode, StrictSubRule, MaterialDefinition, ClipboardData, ContainerProperties, LinkProperties, getLinkCorridorIds } from './models/types';
+import { getEffectiveContainerOutputEdge } from './components/canvas/pipeRouter';
 
 export default function App() {
   const [vm] = useState(() => new CanvasViewModel());
@@ -391,6 +392,15 @@ export default function App() {
                 notes = parts[13].replace(/^"|"$/g, '').replace(/""/g, '"').trim();
               }
 
+              const outputEdgeIdx = nodeHeaderCols.indexOf('outputedge');
+              const rawOutputEdge = outputEdgeIdx !== -1 && parts[outputEdgeIdx]
+                ? parts[outputEdgeIdx].replace(/^"|"$/g, '').trim().toUpperCase()
+                : '';
+              const validEdges: CardinalEdge[] = ['N', 'E', 'S', 'W'];
+              const outputEdge = validEdges.includes(rawOutputEdge as CardinalEdge)
+                ? (rawOutputEdge as CardinalEdge)
+                : undefined;
+
               parsedNodes.push({
                 id: parts[0].trim(),
                 name: parts[1].replace(/^"|"$/g, '').trim(),
@@ -405,6 +415,7 @@ export default function App() {
                 strictSubRule,
                 headroomThreshold: isNaN(headroomThreshold) ? 500 : headroomThreshold,
                 status,
+                ...(outputEdge ? { outputEdge } : {}),
                 notes: notes || undefined
               });
             }
@@ -696,6 +707,25 @@ export default function App() {
     showToast('Clipboard cleared.', 'success');
   }, []);
 
+  const handleCycleContainerOutputEdge = useCallback((reverse = false) => {
+    if (isPlayback || selectedNodeIds.length === 0) return;
+    const EDGE_ORDER: CardinalEdge[] = ['N', 'E', 'S', 'W'];
+    const currentNodes = vm.getNodes();
+    const currentLinks = vm.getLinks();
+    const currentCorridors = vm.getCorridors();
+
+    selectedNodeIds.forEach(nodeId => {
+      const node = currentNodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const currentEdge = getEffectiveContainerOutputEdge(node, currentNodes, currentLinks, currentCorridors);
+      const idx = EDGE_ORDER.indexOf(currentEdge);
+      const nextEdge = EDGE_ORDER[(idx + (reverse ? 3 : 1)) % 4];
+      vm.setNodeOutputEdge(node.id, nextEdge);
+    });
+
+    setNodes(vm.getNodes().map(n => ({ ...n })));
+  }, [isPlayback, selectedNodeIds, vm]);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const activeEl = document.activeElement;
@@ -715,10 +745,17 @@ export default function App() {
         return;
       }
 
+      const key = e.key.toLowerCase();
       const isCtrlOrCmd = e.ctrlKey || e.metaKey;
+
+      if (!isCtrlOrCmd && !e.altKey && key === 'e' && !isPlayback && selectedNodeIds.length > 0) {
+        e.preventDefault();
+        handleCycleContainerOutputEdge(e.shiftKey);
+        return;
+      }
+
       if (!isCtrlOrCmd) return;
 
-      const key = e.key.toLowerCase();
       if (key === 'c') {
         e.preventDefault();
         handleCopy();
@@ -728,15 +765,19 @@ export default function App() {
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown, true);
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keydown', handleKeyDown, true);
     };
-  }, [handleCopy, handlePaste, handleDeleteSelected, isPlayback, hasSelection]);
+  }, [handleCopy, handlePaste, handleDeleteSelected, handleCycleContainerOutputEdge, isPlayback, hasSelection, selectedNodeIds.length]);
 
   const handleUpdateSingleNode = (field: keyof ContainerNode, val: any) => {
     if (!singleSelectedNode || isPlayback) return;
-    vm.updateNode(singleSelectedNode.id, { [field]: val });
+    if (field === 'outputEdge') {
+      vm.setNodeOutputEdge(singleSelectedNode.id, val || undefined);
+    } else {
+      vm.updateNode(singleSelectedNode.id, { [field]: val });
+    }
     setNodes(vm.getNodes().map(n => ({ ...n })));
   };
 

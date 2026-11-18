@@ -2,6 +2,7 @@ export type ContainerType = 'excavation' | 'stockpile' | 'null' | 'external';
 export type OverflowMode = 'strict' | 'overfill';
 export type StrictSubRule = 'throttleback' | 'headroom_hold';
 export type NodeStatus = 'active' | 'maintenance' | 'blocked';
+export type CardinalEdge = 'N' | 'E' | 'S' | 'W';
 
 export interface MaterialDefinition {
   code: string;
@@ -25,6 +26,7 @@ export interface ContainerNode {
   headroomThreshold?: number; // e.g. 500 m³ spare space required to resume after headroom hold
   status?: NodeStatus;
   allowedMaterials?: string[];
+  outputEdge?: CardinalEdge;
   notes?: string;
 }
 
@@ -98,6 +100,7 @@ export interface ContainerProperties {
   headroomThreshold?: number;
   status?: NodeStatus;
   allowedMaterials?: string[];
+  outputEdge?: CardinalEdge;
   notes?: string;
 }
 

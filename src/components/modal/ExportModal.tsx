@@ -96,7 +96,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       // 2. Container nodes with all properties
       lines.push('# SECTION: INITIAL MODEL NODES');
-      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes');
+      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge');
       const day0Frame = frames[0];
       nodes.forEach(n => {
         const escapedName = `"${(n.name || '').replace(/"/g, '""')}"`;
@@ -108,7 +108,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         const day0Status: FlowStatus = day0Frame?.nodeStatuses?.[n.id] ?? 'frozen';
         const meta = getStatusMeta(day0Status, 0);
         const escapedNotes = `"${(n.notes || '').replace(/"/g, '""')}"`;
-        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes}`);
+        const outputEdge = n.outputEdge || '';
+        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge}`);
       });
       lines.push('');
 
@@ -259,7 +260,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         overflowMode: n.overflowMode || 'strict',
         strictSubRule: n.strictSubRule || 'throttleback',
         headroomThreshold: n.headroomThreshold ?? 500,
-        status: n.status || 'active'
+        status: n.status || 'active',
+        outputEdge: n.outputEdge || ''
       }));
       payload.corridors = corridors.map(c => ({
         id: c.id,

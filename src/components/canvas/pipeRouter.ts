@@ -1,5 +1,5 @@
 import { AvoidLib, type Avoid, type ConnDirFlags, type ShapeRef } from 'libavoid-js';
-import { getLinkCorridorIds, type ContainerNode, type Point, type RouteCorridor, type TransferLink } from '../../models/types';
+import { getLinkCorridorIds, type CardinalEdge, type ContainerNode, type Point, type RouteCorridor, type TransferLink } from '../../models/types';
 
 export type { Point };
 
@@ -11,9 +11,11 @@ export interface ComputedRoute {
   startPort: Point;
   endPort: Point;
   badgePt: Point;
+  sDir: CardinalEdge;
+  tDir: CardinalEdge;
 }
 
-type CardinalDirection = 'N' | 'S' | 'E' | 'W';
+type CardinalDirection = CardinalEdge;
 
 interface PortOption {
   point: Point;
@@ -23,6 +25,8 @@ interface PortOption {
 const CARD_W = 120;
 const CARD_H = 80;
 const LANE_SPACING = 12;
+// Minimum straight socket lead length at both output and input container edges before any turn point
+const MIN_SOCKET_LEAD = 50;
 
 let avoidInstance: Avoid | null = null;
 let avoidLoadPromise: Promise<boolean> | null = null;
@@ -144,9 +148,12 @@ export const offsetPolyline = (pts: Point[], offset: number): Point[] => {
 
 const selectBestCardinalFaces = (
   source: ContainerNode,
-  target: ContainerNode
+  target: ContainerNode,
+  forcedSDir?: CardinalDirection
 ): { sDir: CardinalDirection; tDir: CardinalDirection } => {
-  const srcPorts = getCardinalPorts(source);
+  const srcPorts = forcedSDir
+    ? getCardinalPorts(source).filter((p) => p.dir === forcedSDir)
+    : getCardinalPorts(source);
   const tgtPorts = getCardinalPorts(target);
 
   const srcCenter = { x: source.x + CARD_W / 2, y: source.y + CARD_H / 2 };
@@ -155,8 +162,10 @@ const selectBestCardinalFaces = (
   const dy = Math.abs(tgtCenter.y - srcCenter.y);
 
   let bestScore = -Infinity;
+  const defaultAutoSDir: CardinalDirection =
+    dx >= dy ? (tgtCenter.x >= srcCenter.x ? 'E' : 'W') : (tgtCenter.y >= srcCenter.y ? 'S' : 'N');
   let bestFaces: { sDir: CardinalDirection; tDir: CardinalDirection } = {
-    sDir: dx >= dy ? (tgtCenter.x >= srcCenter.x ? 'E' : 'W') : (tgtCenter.y >= srcCenter.y ? 'S' : 'N'),
+    sDir: forcedSDir ?? defaultAutoSDir,
     tDir: dx >= dy ? (tgtCenter.x >= srcCenter.x ? 'W' : 'E') : (tgtCenter.y >= srcCenter.y ? 'N' : 'S')
   };
 
@@ -210,6 +219,23 @@ const selectBestCardinalFaces = (
       }
     });
   });
+
+  if (forcedSDir && bestScore === -Infinity && srcPorts[0]) {
+    const port = srcPorts[0].point;
+    const outVec =
+      forcedSDir === 'N'
+        ? { x: 0, y: -32 }
+        : forcedSDir === 'S'
+        ? { x: 0, y: 32 }
+        : forcedSDir === 'E'
+        ? { x: 32, y: 0 }
+        : { x: -32, y: 0 };
+    const exitHint = { x: port.x + outVec.x, y: port.y + outVec.y };
+    bestFaces = {
+      sDir: forcedSDir,
+      tDir: selectBestTargetFaceFromPoint(exitHint, target)
+    };
+  }
 
   return bestFaces;
 };
@@ -435,7 +461,7 @@ const computeTopologyKey = (
   linksList: TransferLink[],
   corridorsList: RouteCorridor[]
 ): string => {
-  const nodeKey = nodesList.map((n) => `${n.id}:${n.x},${n.y}`).join('|');
+  const nodeKey = nodesList.map((n) => `${n.id}:${n.x},${n.y}:${n.outputEdge || ''}`).join('|');
   const linkKey = linksList
     .map((l) => `${l.id}:${l.sourceId}->${l.targetId}@${getLinkCorridorIds(l).join(',')}`)
     .join('|');
@@ -829,11 +855,11 @@ export const computeAllLinkRoutes = (
         if (tgtAlong) exitHint = tgtAlong.point;
       }
 
-      const sDir = selectBestSourceFaceTowardPoint(source, entryHint);
+      const sDir = source.outputEdge ?? selectBestSourceFaceTowardPoint(source, entryHint);
       const tDir = selectBestTargetFaceFromPoint(exitHint, target);
       validLinks.push({ link, source, target, sDir, tDir, corridorChain });
     } else {
-      const { sDir, tDir } = selectBestCardinalFaces(source, target);
+      const { sDir, tDir } = selectBestCardinalFaces(source, target, source.outputEdge);
       validLinks.push({ link, source, target, sDir, tDir });
     }
   });
@@ -853,6 +879,7 @@ export const computeAllLinkRoutes = (
     mouthPt: Point;
     lanePerp: number;
     portPerp: number;
+    remoteAlongDist: number;
   }
 
   const computeSafeStaggeredAnchor = (mouthPt: Point, outTangent: Point, rawStagger: number): Point => {
@@ -992,20 +1019,26 @@ export const computeAllLinkRoutes = (
           if (!needsMouthStagger(entryPt, entryOut, entrySideNorm, approachPt, approachOutVec)) {
             entryAnchorMap.set(key, entryPt);
           } else {
+            const alongDist =
+              (approachPt.x - entryPt.x) * entryOut.x + (approachPt.y - entryPt.y) * entryOut.y;
+            const maxClearStagger =
+              isFirstStep && alongDist > 0 ? Math.max(0, alongDist - MIN_SOCKET_LEAD - 6) : Infinity;
             const mouthAtt: MouthAttachment = !assign.isReversed
               ? {
                   stepKey: key,
                   role: 'entry',
                   mouthPt: entryPt,
                   lanePerp: (entryPt.x - baseStart.x) * sideNormStart.x + (entryPt.y - baseStart.y) * sideNormStart.y,
-                  portPerp: (approachPt.x - baseStart.x) * sideNormStart.x + (approachPt.y - baseStart.y) * sideNormStart.y
+                  portPerp: (approachPt.x - baseStart.x) * sideNormStart.x + (approachPt.y - baseStart.y) * sideNormStart.y,
+                  remoteAlongDist: maxClearStagger
                 }
               : {
                   stepKey: key,
                   role: 'entry',
                   mouthPt: entryPt,
                   lanePerp: (entryPt.x - baseEnd.x) * sideNormEnd.x + (entryPt.y - baseEnd.y) * sideNormEnd.y,
-                  portPerp: (approachPt.x - baseEnd.x) * sideNormEnd.x + (approachPt.y - baseEnd.y) * sideNormEnd.y
+                  portPerp: (approachPt.x - baseEnd.x) * sideNormEnd.x + (approachPt.y - baseEnd.y) * sideNormEnd.y,
+                  remoteAlongDist: maxClearStagger
                 };
             if (!assign.isReversed) startMouthAttachments.push(mouthAtt);
             else endMouthAttachments.push(mouthAtt);
@@ -1021,20 +1054,26 @@ export const computeAllLinkRoutes = (
           if (!needsMouthStagger(exitPt, exitOut, exitSideNorm, departurePt, departureOutVec)) {
             exitAnchorMap.set(key, exitPt);
           } else {
+            const alongDist =
+              (departurePt.x - exitPt.x) * exitOut.x + (departurePt.y - exitPt.y) * exitOut.y;
+            const maxClearStagger =
+              isLastStep && alongDist > 0 ? Math.max(0, alongDist - MIN_SOCKET_LEAD - 6) : Infinity;
             const mouthAtt: MouthAttachment = !assign.isReversed
               ? {
                   stepKey: key,
                   role: 'exit',
                   mouthPt: exitPt,
                   lanePerp: (exitPt.x - baseEnd.x) * sideNormEnd.x + (exitPt.y - baseEnd.y) * sideNormEnd.y,
-                  portPerp: (departurePt.x - baseEnd.x) * sideNormEnd.x + (departurePt.y - baseEnd.y) * sideNormEnd.y
+                  portPerp: (departurePt.x - baseEnd.x) * sideNormEnd.x + (departurePt.y - baseEnd.y) * sideNormEnd.y,
+                  remoteAlongDist: maxClearStagger
                 }
               : {
                   stepKey: key,
                   role: 'exit',
                   mouthPt: exitPt,
                   lanePerp: (exitPt.x - baseStart.x) * sideNormStart.x + (exitPt.y - baseStart.y) * sideNormStart.y,
-                  portPerp: (departurePt.x - baseStart.x) * sideNormStart.x + (departurePt.y - baseStart.y) * sideNormStart.y
+                  portPerp: (departurePt.x - baseStart.x) * sideNormStart.x + (departurePt.y - baseStart.y) * sideNormStart.y,
+                  remoteAlongDist: maxClearStagger
                 };
             if (!assign.isReversed) endMouthAttachments.push(mouthAtt);
             else startMouthAttachments.push(mouthAtt);
@@ -1052,7 +1091,8 @@ export const computeAllLinkRoutes = (
 
       [posGroup, negGroup].forEach((grp) => {
         grp.forEach((att, idx) => {
-          const anchor = computeSafeStaggeredAnchor(att.mouthPt, outTangent, idx * STAGGER_STEP);
+          const cappedStagger = Math.min(idx * STAGGER_STEP, att.remoteAlongDist);
+          const anchor = computeSafeStaggeredAnchor(att.mouthPt, outTangent, cappedStagger);
           if (att.role === 'entry') entryAnchorMap.set(att.stepKey, anchor);
           else exitAnchorMap.set(att.stepKey, anchor);
         });
@@ -1074,6 +1114,8 @@ export const computeAllLinkRoutes = (
 
   const srcLaneOffsets = new Map<string, number>();
   const tgtLaneOffsets = new Map<string, number>();
+  const srcLeadDists = new Map<string, number>();
+  const tgtLeadDists = new Map<string, number>();
   const faceGroups = new Map<string, FaceAttachment[]>();
 
   const addAttachment = (nodeId: string, att: FaceAttachment) => {
@@ -1134,10 +1176,16 @@ export const computeAllLinkRoutes = (
   };
 
   faceGroups.forEach((group) => {
+    const setLeadDist = (att: FaceAttachment, dist: number) => {
+      if (att.role === 'source') srcLeadDists.set(att.linkId, dist);
+      else tgtLeadDists.set(att.linkId, dist);
+    };
+
     if (group.length === 1) {
       const only = group[0];
       if (only.role === 'source') srcLaneOffsets.set(only.linkId, 0);
       else tgtLaneOffsets.set(only.linkId, 0);
+      setLeadDist(only, MIN_SOCKET_LEAD);
       return;
     }
 
@@ -1161,7 +1209,273 @@ export const computeAllLinkRoutes = (
       if (att.role === 'source') srcLaneOffsets.set(att.linkId, offset);
       else tgtLaneOffsets.set(att.linkId, offset);
     });
+
+    // Nest minimum socket lead lengths across all links sharing an edge so turning pipes never collide
+    const negTurners: FaceAttachment[] = [];
+    const posTurners: FaceAttachment[] = [];
+    group.forEach((att) => {
+      const angle = getFaceOutwardTangentAngle(node, dir, att.aimPoint);
+      if (angle < -0.05) {
+        negTurners.push(att);
+      } else if (angle > 0.05) {
+        posTurners.push(att);
+      } else {
+        setLeadDist(att, MIN_SOCKET_LEAD);
+      }
+    });
+    negTurners.forEach((att, i) => {
+      setLeadDist(att, MIN_SOCKET_LEAD + i * LANE_SPACING);
+    });
+    posTurners.forEach((att, i) => {
+      setLeadDist(att, MIN_SOCKET_LEAD + (posTurners.length - 1 - i) * LANE_SPACING);
+    });
   });
+
+  const oppositeCardinal = (dir: CardinalDirection): CardinalDirection => {
+    switch (dir) {
+      case 'N':
+        return 'S';
+      case 'S':
+        return 'N';
+      case 'E':
+        return 'W';
+      case 'W':
+        return 'E';
+    }
+  };
+
+  const shouldSkipDirectLeadsForStraightGap = (
+    startPort: Point,
+    endPort: Point,
+    sDir: CardinalDirection,
+    tDir: CardinalDirection,
+    minCombinedLead: number
+  ): boolean => {
+    if (oppositeCardinal(sDir) !== tDir) return false;
+    const sVec = cardinalToVec(sDir);
+    const forward = (endPort.x - startPort.x) * sVec.x + (endPort.y - startPort.y) * sVec.y;
+    const perp = Math.abs((endPort.x - startPort.x) * -sVec.y + (endPort.y - startPort.y) * sVec.x);
+    return perp < 1 && forward > 0 && forward <= minCombinedLead + 4;
+  };
+
+  // 3.6 Cross-container aligned socket track allocation so aligned containers never overlay turn segments
+  {
+    const getOutCoord = (p: Point, d: CardinalDirection): number =>
+      d === 'E' ? p.x : d === 'W' ? -p.x : d === 'S' ? p.y : -p.y;
+    const getPerpCoord = (p: Point, d: CardinalDirection): number =>
+      d === 'E' || d === 'W' ? p.y : p.x;
+
+    interface SocketTrackRecord {
+      idx: number;
+      key: string;
+      linkId: string;
+      role: 'source' | 'target';
+      dir: CardinalDirection;
+      portPerp: number;
+      aimPerp: number;
+      deltaPerp: number;
+      minPerp: number;
+      maxPerp: number;
+      outStart: number;
+      leadDist: number;
+    }
+
+    const recordsByDir = new Map<CardinalDirection, SocketTrackRecord[]>();
+    const addTrackRecord = (rec: Omit<SocketTrackRecord, 'idx'>) => {
+      if (Math.abs(rec.deltaPerp) < 2) return;
+      if (!recordsByDir.has(rec.dir)) recordsByDir.set(rec.dir, []);
+      const arr = recordsByDir.get(rec.dir)!;
+      arr.push({ ...rec, idx: arr.length });
+    };
+
+    validLinks.forEach((item) => {
+      const chain = item.corridorChain;
+      const hasChain = Boolean(chain && chain.length > 0);
+      const srcOffset = srcLaneOffsets.get(item.link.id) || 0;
+      const tgtOffset = tgtLaneOffsets.get(item.link.id) || 0;
+      const startPort = getPortWithLaneOffset(item.source, item.sDir, srcOffset);
+      const endPort = getPortWithLaneOffset(item.target, item.tDir, tgtOffset);
+      const rawSrcLead = srcLeadDists.get(item.link.id) ?? MIN_SOCKET_LEAD;
+      const rawTgtLead = tgtLeadDists.get(item.link.id) ?? MIN_SOCKET_LEAD;
+
+      if (!hasChain && shouldSkipDirectLeadsForStraightGap(startPort, endPort, item.sDir, item.tDir, rawSrcLead + rawTgtLead)) {
+        return;
+      }
+
+      const firstLane = hasChain ? chain![0].lanePts : undefined;
+      const lastLane = hasChain ? chain![chain!.length - 1].lanePts : undefined;
+      const firstKey = makeStepKey(item.link.id, 0);
+      const lastKey = makeStepKey(item.link.id, (chain?.length || 1) - 1);
+
+      const srcAim = firstLane
+        ? entryAlongsideSet.has(firstKey) && firstLane.length >= 2
+          ? firstLane[1]
+          : (entryAnchorMap.get(firstKey) ?? firstLane[0])
+        : endPort;
+      const tgtAim = lastLane
+        ? exitAlongsideSet.has(lastKey) && lastLane.length >= 2
+          ? lastLane[lastLane.length - 2]
+          : (exitAnchorMap.get(lastKey) ?? lastLane[lastLane.length - 1])
+        : startPort;
+
+      const sPortPerp = getPerpCoord(startPort, item.sDir);
+      const sAimPerp = getPerpCoord(srcAim, item.sDir);
+      addTrackRecord({
+        key: `${item.link.id}:source`,
+        linkId: item.link.id,
+        role: 'source',
+        dir: item.sDir,
+        portPerp: sPortPerp,
+        aimPerp: sAimPerp,
+        deltaPerp: sAimPerp - sPortPerp,
+        minPerp: Math.min(sPortPerp, sAimPerp),
+        maxPerp: Math.max(sPortPerp, sAimPerp),
+        outStart: getOutCoord(startPort, item.sDir),
+        leadDist: rawSrcLead
+      });
+
+      const tPortPerp = getPerpCoord(endPort, item.tDir);
+      const tAimPerp = getPerpCoord(tgtAim, item.tDir);
+      addTrackRecord({
+        key: `${item.link.id}:target`,
+        linkId: item.link.id,
+        role: 'target',
+        dir: item.tDir,
+        portPerp: tPortPerp,
+        aimPerp: tAimPerp,
+        deltaPerp: tAimPerp - tPortPerp,
+        minPerp: Math.min(tPortPerp, tAimPerp),
+        maxPerp: Math.max(tPortPerp, tAimPerp),
+        outStart: getOutCoord(endPort, item.tDir),
+        leadDist: rawTgtLead
+      });
+    });
+
+    const PERP_CLEAR_PAD = 10;
+    const STEM_PAD = 4;
+
+    recordsByDir.forEach((group) => {
+      if (group.length <= 1) return;
+
+      const n = group.length;
+      const adj: number[][] = Array.from({ length: n }, () => []);
+      const inDeg = new Array<number>(n).fill(0);
+
+      for (let i = 0; i < n; i++) {
+        const a = group[i];
+        for (let j = i + 1; j < n; j++) {
+          const b = group[j];
+          const bCrossesA = b.minPerp - STEM_PAD <= a.portPerp && a.portPerp <= b.maxPerp + STEM_PAD;
+          const aCrossesB = a.minPerp - STEM_PAD <= b.portPerp && b.portPerp <= a.maxPerp + STEM_PAD;
+          if (bCrossesA && !aCrossesB) {
+            adj[i].push(j);
+            inDeg[j]++;
+          } else if (aCrossesB && !bCrossesA) {
+            adj[j].push(i);
+            inDeg[i]++;
+          }
+        }
+      }
+
+      const sortIndices = (aIdx: number, bIdx: number) =>
+        group[aIdx].outStart - group[bIdx].outStart ||
+        Math.abs(group[aIdx].deltaPerp) - Math.abs(group[bIdx].deltaPerp) ||
+        group[aIdx].key.localeCompare(group[bIdx].key);
+
+      const used = new Array<boolean>(n).fill(false);
+      const ordered: SocketTrackRecord[] = [];
+      const ready: number[] = [];
+      for (let i = 0; i < n; i++) {
+        if (inDeg[i] === 0) ready.push(i);
+      }
+
+      while (ordered.length < n) {
+        if (ready.length === 0) {
+          const remaining: number[] = [];
+          for (let i = 0; i < n; i++) {
+            if (!used[i]) remaining.push(i);
+          }
+          remaining.sort(sortIndices);
+          ready.push(remaining[0]);
+        }
+        ready.sort(sortIndices);
+        const cur = ready.shift()!;
+        if (used[cur]) continue;
+        used[cur] = true;
+        ordered.push(group[cur]);
+        for (const nxt of adj[cur]) {
+          inDeg[nxt]--;
+          if (inDeg[nxt] === 0 && !used[nxt]) ready.push(nxt);
+        }
+      }
+
+      interface PlacedTrack extends SocketTrackRecord {
+        turnOut: number;
+      }
+
+      const placed: PlacedTrack[] = [];
+      for (const r of ordered) {
+        let minAllowedOut = r.outStart + r.leadDist;
+        for (const p of placed) {
+          if (r.minPerp - STEM_PAD <= p.portPerp && p.portPerp <= r.maxPerp + STEM_PAD && minAllowedOut >= p.outStart - STEM_PAD) {
+            minAllowedOut = Math.max(minAllowedOut, p.turnOut + LANE_SPACING);
+          }
+        }
+
+        let candidateOut = minAllowedOut;
+        let moved = true;
+        while (moved) {
+          moved = false;
+          for (const p of placed) {
+            if (Math.abs(candidateOut - p.turnOut) < LANE_SPACING - 0.5) {
+              const overlapsPerp = Math.max(r.minPerp, p.minPerp) <= Math.min(r.maxPerp, p.maxPerp) + PERP_CLEAR_PAD;
+              if (overlapsPerp) {
+                candidateOut = Math.max(candidateOut, p.turnOut + LANE_SPACING);
+                moved = true;
+              }
+            }
+          }
+        }
+
+        const updatedLead = candidateOut - r.outStart;
+        if (r.role === 'source') srcLeadDists.set(r.linkId, updatedLead);
+        else tgtLeadDists.set(r.linkId, updatedLead);
+        placed.push({ ...r, turnOut: candidateOut });
+      }
+    });
+  }
+
+  const computeSafeSocketLeadPt = (
+    port: Point,
+    dir: CardinalDirection,
+    leadDist: number,
+    destPt: Point,
+    mouthOutTangent?: Point
+  ): Point | null => {
+    const vec = cardinalToVec(dir);
+    const forwardToDest = (destPt.x - port.x) * vec.x + (destPt.y - port.y) * vec.y;
+    const perpToDest = Math.abs((destPt.x - port.x) * -vec.y + (destPt.y - port.y) * vec.x);
+    if (perpToDest < 1 && forwardToDest > 0 && forwardToDest <= leadDist + 4) {
+      return null;
+    }
+    let effectiveLead = leadDist;
+    if (mouthOutTangent && forwardToDest > 0 && forwardToDest < leadDist + 6) {
+      const facingMouth = vec.x * mouthOutTangent.x + vec.y * mouthOutTangent.y < -0.5;
+      if (facingMouth) {
+        if (forwardToDest <= 14) return null;
+        effectiveLead = Math.min(leadDist, Math.max(12, forwardToDest - 6));
+      }
+    }
+    for (let d = effectiveLead; d >= 8; d -= 4) {
+      const candidate = {
+        x: port.x + vec.x * d,
+        y: port.y + vec.y * d
+      };
+      const blocked = nodesList.some((n) => isPointInsideNode(candidate, n, -5));
+      if (!blocked) return candidate;
+    }
+    return null;
+  };
 
   const getAnchoredStepPts = (
     linkId: string,
@@ -1221,6 +1535,8 @@ export const computeAllLinkRoutes = (
     points: Point[];
     startPort: Point;
     endPort: Point;
+    sDir: CardinalDirection;
+    tDir: CardinalDirection;
     corridorSegments: { p1: Point; p2: Point }[];
   }
 
@@ -1237,312 +1553,473 @@ export const computeAllLinkRoutes = (
       : 'N';
 
   if (avoid && validLinks.length > 0) {
-    const router = new avoid.Router(avoid.RouterFlag.OrthogonalRouting);
-    try {
-      // Shape buffer of 5px keeps corridors clear while fitting cleanly inside 12px snapped gaps (5 + 5 < 12)
-      router.setRoutingParameter(avoid.RoutingParameter.shapeBufferDistance, 5);
-      router.setRoutingParameter(avoid.RoutingParameter.idealNudgingDistance, LANE_SPACING);
-      router.setRoutingParameter(avoid.RoutingParameter.segmentPenalty, 10);
-      router.setRoutingParameter(avoid.RoutingParameter.crossingPenalty, 150);
-      router.setRoutingParameter(avoid.RoutingParameter.fixedSharedPathPenalty, 50);
+    const runWasmRoutingPass = () => {
+      const passRoutes: TempRoute[] = [];
+      const leadsByLink = new Map<string, { srcLeadPt: Point | null; tgtLeadPt: Point | null }>();
+      const router = new avoid.Router(avoid.RouterFlag.OrthogonalRouting);
+      try {
+        // Shape buffer of 5px keeps corridors clear while fitting cleanly inside 12px snapped gaps (5 + 5 < 12)
+        router.setRoutingParameter(avoid.RoutingParameter.shapeBufferDistance, 5);
+        router.setRoutingParameter(avoid.RoutingParameter.idealNudgingDistance, LANE_SPACING);
+        router.setRoutingParameter(avoid.RoutingParameter.segmentPenalty, 10);
+        router.setRoutingParameter(avoid.RoutingParameter.crossingPenalty, 150);
+        router.setRoutingParameter(avoid.RoutingParameter.fixedSharedPathPenalty, 50);
 
-      // Keep port anchor segments locked to the sorted lane offsets while nudging shared interior corridors
-      router.setRoutingOption(avoid.RoutingOption.nudgeOrthogonalSegmentsConnectedToShapes, false);
-      router.setRoutingOption(avoid.RoutingOption.nudgeOrthogonalTouchingColinearSegments, true);
-      router.setRoutingOption(avoid.RoutingOption.performUnifyingNudgingPreprocessingStep, true);
+        // Keep port anchor segments locked to the sorted lane offsets while nudging shared interior corridors
+        router.setRoutingOption(avoid.RoutingOption.nudgeOrthogonalSegmentsConnectedToShapes, false);
+        router.setRoutingOption(avoid.RoutingOption.nudgeOrthogonalTouchingColinearSegments, true);
+        router.setRoutingOption(avoid.RoutingOption.performUnifyingNudgingPreprocessingStep, true);
 
-      const shapeMap = new Map<string, ShapeRef>();
-      nodesList.forEach((node) => {
-        const shape = router.addShape({
-          x: node.x,
-          y: node.y,
-          width: CARD_W,
-          height: CARD_H
-        });
-        shapeMap.set(node.id, shape);
-      });
-
-      let nextPinClassId = 1;
-      const pendingConnectors: {
-        item: LinkWithFaces;
-        startPort: Point;
-        endPort: Point;
-        anchoredSteps?: Point[][];
-        directConn: ReturnType<typeof router.addConnector> | null;
-        entryConn: ReturnType<typeof router.addConnector> | null;
-        bridgeConns: (ReturnType<typeof router.addConnector> | null)[];
-        exitConn: ReturnType<typeof router.addConnector> | null;
-      }[] = [];
-
-      validLinks.forEach((item) => {
-        const srcOffset = srcLaneOffsets.get(item.link.id) || 0;
-        const tgtOffset = tgtLaneOffsets.get(item.link.id) || 0;
-        const startPort = getPortWithLaneOffset(item.source, item.sDir, srcOffset);
-        const endPort = getPortWithLaneOffset(item.target, item.tDir, tgtOffset);
-
-        const srcShape = shapeMap.get(item.source.id);
-        const tgtShape = shapeMap.get(item.target.id);
-
-        if (!srcShape || !tgtShape || item.source.id === item.target.id) {
-          pendingConnectors.push({
-            item,
-            startPort,
-            endPort,
-            directConn: null,
-            entryConn: null,
-            bridgeConns: [],
-            exitConn: null
+        const shapeMap = new Map<string, ShapeRef>();
+        nodesList.forEach((node) => {
+          const shape = router.addShape({
+            x: node.x,
+            y: node.y,
+            width: CARD_W,
+            height: CARD_H
           });
-          return;
-        }
-
-        const srcPinId = nextPinClassId++;
-        const tgtPinId = nextPinClassId++;
-
-        srcShape.addPin({
-          classId: srcPinId,
-          x: startPort.x - item.source.x,
-          y: startPort.y - item.source.y,
-          proportional: false,
-          directions: toConnDirFlag(avoid, item.sDir)
+          shapeMap.set(node.id, shape);
         });
 
-        tgtShape.addPin({
-          classId: tgtPinId,
-          x: endPort.x - item.target.x,
-          y: endPort.y - item.target.y,
-          proportional: false,
-          directions: toConnDirFlag(avoid, item.tDir)
-        });
+        const getLeadDepartureDirs = (dir: CardinalDirection): ConnDirFlags =>
+          avoid.ConnDirFlag.ConnDirAll & ~toConnDirFlag(avoid, oppositeCardinal(dir));
 
-        if (item.corridorChain && item.corridorChain.length > 0) {
-          const totalSteps = item.corridorChain.length;
-          const anchoredSteps = item.corridorChain.map((step, sIdx) =>
-            getAnchoredStepPts(item.link.id, sIdx, totalSteps, step.lanePts, startPort, endPort)
-          );
+        let nextPinClassId = 1;
+        const pendingConnectors: {
+          item: LinkWithFaces;
+          startPort: Point;
+          endPort: Point;
+          srcLeadPt: Point | null;
+          tgtLeadPt: Point | null;
+          anchoredSteps?: Point[][];
+          directConn: ReturnType<typeof router.addConnector> | null;
+          entryConn: ReturnType<typeof router.addConnector> | null;
+          bridgeConns: (ReturnType<typeof router.addConnector> | null)[];
+          exitConn: ReturnType<typeof router.addConnector> | null;
+        }[] = [];
 
-          const getPointEndDirs = (
-            mouthPt: Point,
-            outTangent: Point,
-            remotePt: Point,
-            isAlongside: boolean
-          ): ConnDirFlags => {
-            if (isAlongside) {
-              const perpDir: CardinalDirection =
-                Math.abs(outTangent.x) >= Math.abs(outTangent.y)
-                  ? remotePt.y < mouthPt.y
-                    ? 'N'
-                    : 'S'
-                  : remotePt.x < mouthPt.x
-                  ? 'W'
-                  : 'E';
-              return toConnDirFlag(avoid, perpDir);
-            }
+        validLinks.forEach((item) => {
+          const srcOffset = srcLaneOffsets.get(item.link.id) || 0;
+          const tgtOffset = tgtLaneOffsets.get(item.link.id) || 0;
+          const startPort = getPortWithLaneOffset(item.source, item.sDir, srcOffset);
+          const endPort = getPortWithLaneOffset(item.target, item.tDir, tgtOffset);
+          const rawSrcLeadDist = srcLeadDists.get(item.link.id) ?? MIN_SOCKET_LEAD;
+          const rawTgtLeadDist = tgtLeadDists.get(item.link.id) ?? MIN_SOCKET_LEAD;
 
-            const forward =
-              (remotePt.x - mouthPt.x) * outTangent.x + (remotePt.y - mouthPt.y) * outTangent.y;
-            let flags: ConnDirFlags = 0;
-            if (Math.abs(outTangent.x) > 0.25) {
-              flags |= toConnDirFlag(avoid, outTangent.x >= 0 ? 'E' : 'W');
-            }
-            if (Math.abs(outTangent.y) > 0.25) {
-              flags |= toConnDirFlag(avoid, outTangent.y >= 0 ? 'S' : 'N');
-            }
-            if (forward > 4) {
-              return flags || avoid.ConnDirFlag.ConnDirAll;
-            }
-            // Allow perpendicular exit/entry when remote point is beside/behind the mouth without doubling back into the corridor
-            if (Math.abs(outTangent.x) >= Math.abs(outTangent.y)) {
-              flags |= avoid.ConnDirFlag.ConnDirUp | avoid.ConnDirFlag.ConnDirDown;
-            } else {
-              flags |= avoid.ConnDirFlag.ConnDirLeft | avoid.ConnDirFlag.ConnDirRight;
-            }
-            return flags;
-          };
+          const srcShape = shapeMap.get(item.source.id);
+          const tgtShape = shapeMap.get(item.target.id);
 
-          const firstStep = item.corridorChain[0];
-          const firstEntryPt = anchoredSteps[0][0];
-          const firstOutTangent = getCorridorMouthVectors(firstStep.corridor, !firstStep.isReversed).outTangent;
-          const firstEntryKey = makeStepKey(item.link.id, 0);
-          const firstEntryDirs = getPointEndDirs(
-            firstEntryPt,
-            firstOutTangent,
-            startPort,
-            entryAlongsideSet.has(firstEntryKey)
-          );
-
-          const lastStepIdx = totalSteps - 1;
-          const lastStepMeta = item.corridorChain[lastStepIdx];
-          const lastStep = anchoredSteps[lastStepIdx];
-          const lastExitPt = lastStep[lastStep.length - 1];
-          const lastOutTangent = getCorridorMouthVectors(lastStepMeta.corridor, lastStepMeta.isReversed).outTangent;
-          const lastExitKey = makeStepKey(item.link.id, lastStepIdx);
-          const lastExitDirs = getPointEndDirs(
-            lastExitPt,
-            lastOutTangent,
-            endPort,
-            exitAlongsideSet.has(lastExitKey)
-          );
-
-          const entryConn = router.addConnector(
-            { shape: srcShape, pin: srcPinId },
-            { x: firstEntryPt.x, y: firstEntryPt.y, directions: firstEntryDirs }
-          );
-
-          const bridgeConns: (ReturnType<typeof router.addConnector> | null)[] = [];
-          for (let s = 0; s < totalSteps - 1; s++) {
-            const curExit = anchoredSteps[s][anchoredSteps[s].length - 1];
-            const nextEntry = anchoredSteps[s + 1][0];
-            if (Math.hypot(nextEntry.x - curExit.x, nextEntry.y - curExit.y) < 1) {
-              bridgeConns.push(null);
-            } else {
-              const curMeta = item.corridorChain[s];
-              const nextMeta = item.corridorChain[s + 1];
-              const curOutTangent = getCorridorMouthVectors(curMeta.corridor, curMeta.isReversed).outTangent;
-              const nextOutTangent = getCorridorMouthVectors(nextMeta.corridor, !nextMeta.isReversed).outTangent;
-              const curExitDirs = getPointEndDirs(curExit, curOutTangent, nextEntry, false);
-              const nextEntryDirs = getPointEndDirs(nextEntry, nextOutTangent, curExit, false);
-
-              bridgeConns.push(
-                router.addConnector(
-                  { x: curExit.x, y: curExit.y, directions: curExitDirs },
-                  { x: nextEntry.x, y: nextEntry.y, directions: nextEntryDirs }
-                )
-              );
-            }
+          if (!srcShape || !tgtShape || item.source.id === item.target.id) {
+            pendingConnectors.push({
+              item,
+              startPort,
+              endPort,
+              srcLeadPt: null,
+              tgtLeadPt: null,
+              directConn: null,
+              entryConn: null,
+              bridgeConns: [],
+              exitConn: null
+            });
+            return;
           }
 
-          const exitConn = router.addConnector(
-            { x: lastExitPt.x, y: lastExitPt.y, directions: lastExitDirs },
-            { shape: tgtShape, pin: tgtPinId }
-          );
+          const srcPinId = nextPinClassId++;
+          const tgtPinId = nextPinClassId++;
 
-          pendingConnectors.push({
-            item,
-            startPort,
-            endPort,
-            anchoredSteps,
-            directConn: null,
-            entryConn,
-            bridgeConns,
-            exitConn
+          srcShape.addPin({
+            classId: srcPinId,
+            x: startPort.x - item.source.x,
+            y: startPort.y - item.source.y,
+            proportional: false,
+            directions: toConnDirFlag(avoid, item.sDir)
           });
-        } else {
-          const directConn = router.addConnector(
-            { shape: srcShape, pin: srcPinId },
-            { shape: tgtShape, pin: tgtPinId }
-          );
-          pendingConnectors.push({
-            item,
-            startPort,
-            endPort,
-            directConn,
-            entryConn: null,
-            bridgeConns: [],
-            exitConn: null
+
+          tgtShape.addPin({
+            classId: tgtPinId,
+            x: endPort.x - item.target.x,
+            y: endPort.y - item.target.y,
+            proportional: false,
+            directions: toConnDirFlag(avoid, item.tDir)
           });
-        }
-      });
 
-      router.processTransaction();
+          if (item.corridorChain && item.corridorChain.length > 0) {
+            const totalSteps = item.corridorChain.length;
+            const anchoredSteps = item.corridorChain.map((step, sIdx) =>
+              getAnchoredStepPts(item.link.id, sIdx, totalSteps, step.lanePts, startPort, endPort)
+            );
 
-      pendingConnectors.forEach(({ item, startPort, endPort, anchoredSteps, directConn, entryConn, bridgeConns, exitConn }) => {
-        const corridorSegments: { p1: Point; p2: Point }[] = [];
-        let points: Point[];
+            const getPointEndDirs = (
+              mouthPt: Point,
+              outTangent: Point,
+              remotePt: Point,
+              isAlongside: boolean
+            ): ConnDirFlags => {
+              if (isAlongside) {
+                const perpDir: CardinalDirection =
+                  Math.abs(outTangent.x) >= Math.abs(outTangent.y)
+                    ? remotePt.y < mouthPt.y
+                      ? 'N'
+                      : 'S'
+                    : remotePt.x < mouthPt.x
+                    ? 'W'
+                    : 'E';
+                return toConnDirFlag(avoid, perpDir);
+              }
 
-        if (anchoredSteps && anchoredSteps.length > 0 && item.corridorChain) {
-          const firstEntryPt = anchoredSteps[0][0];
-          const lastStepIdx = anchoredSteps.length - 1;
-          const lastStep = anchoredSteps[lastStepIdx];
-          const lastExitPt = lastStep[lastStep.length - 1];
-          const firstOut = getCorridorMouthVectors(item.corridorChain[0].corridor, !item.corridorChain[0].isReversed).outTangent;
-          const lastOut = getCorridorMouthVectors(item.corridorChain[lastStepIdx].corridor, item.corridorChain[lastStepIdx].isReversed).outTangent;
-
-          let entryPts: Point[];
-          if (entryConn && entryConn.hasValidRoute()) {
-            const r = entryConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
-            entryPts = r.length >= 2 ? r : buildFallbackPoints(startPort, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut));
-          } else {
-            entryPts = buildFallbackPoints(startPort, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut));
-          }
-
-          let exitPts: Point[];
-          if (exitConn && exitConn.hasValidRoute()) {
-            const r = exitConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
-            exitPts = r.length >= 2 ? r : buildFallbackPoints(lastExitPt, endPort, outTangentToArrivalDir(lastOut), item.tDir);
-          } else {
-            exitPts = buildFallbackPoints(lastExitPt, endPort, outTangentToArrivalDir(lastOut), item.tDir);
-          }
-
-          const combined: Point[] = [...entryPts];
-          anchoredSteps.forEach((stepPts, sIdx) => {
-            for (let i = 0; i < stepPts.length - 1; i++) {
-              corridorSegments.push({ p1: stepPts[i], p2: stepPts[i + 1] });
-            }
-            combined.push(...stepPts.slice(1));
-
-            if (sIdx < anchoredSteps.length - 1) {
-              const curExit = stepPts[stepPts.length - 1];
-              const nextEntry = anchoredSteps[sIdx + 1][0];
-              const curOut = getCorridorMouthVectors(item.corridorChain![sIdx].corridor, item.corridorChain![sIdx].isReversed).outTangent;
-              const nextOut = getCorridorMouthVectors(item.corridorChain![sIdx + 1].corridor, !item.corridorChain![sIdx + 1].isReversed).outTangent;
-              const bridgeConn = bridgeConns[sIdx];
-              let bridgePts: Point[];
-              if (bridgeConn && bridgeConn.hasValidRoute()) {
-                const r = bridgeConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
-                bridgePts =
-                  r.length >= 2
-                    ? r
-                    : buildFallbackPoints(
-                        curExit,
-                        nextEntry,
-                        outTangentToArrivalDir(curOut),
-                        outTangentToArrivalDir(nextOut)
-                      );
-              } else if (Math.hypot(nextEntry.x - curExit.x, nextEntry.y - curExit.y) < 1) {
-                bridgePts = [curExit, nextEntry];
+              const forward =
+                (remotePt.x - mouthPt.x) * outTangent.x + (remotePt.y - mouthPt.y) * outTangent.y;
+              let flags: ConnDirFlags = 0;
+              if (Math.abs(outTangent.x) > 0.25) {
+                flags |= toConnDirFlag(avoid, outTangent.x >= 0 ? 'E' : 'W');
+              }
+              if (Math.abs(outTangent.y) > 0.25) {
+                flags |= toConnDirFlag(avoid, outTangent.y >= 0 ? 'S' : 'N');
+              }
+              if (forward > 4) {
+                return flags || avoid.ConnDirFlag.ConnDirAll;
+              }
+              // Allow perpendicular exit/entry when remote point is beside/behind the mouth without doubling back into the corridor
+              if (Math.abs(outTangent.x) >= Math.abs(outTangent.y)) {
+                flags |= avoid.ConnDirFlag.ConnDirUp | avoid.ConnDirFlag.ConnDirDown;
               } else {
-                bridgePts = buildFallbackPoints(
-                  curExit,
-                  nextEntry,
-                  outTangentToArrivalDir(curOut),
-                  outTangentToArrivalDir(nextOut)
+                flags |= avoid.ConnDirFlag.ConnDirLeft | avoid.ConnDirFlag.ConnDirRight;
+              }
+              return flags;
+            };
+
+            const firstStep = item.corridorChain[0];
+            const firstEntryPt = anchoredSteps[0][0];
+            const firstOutTangent = getCorridorMouthVectors(firstStep.corridor, !firstStep.isReversed).outTangent;
+            const firstEntryKey = makeStepKey(item.link.id, 0);
+            const srcLeadPt = computeSafeSocketLeadPt(startPort, item.sDir, rawSrcLeadDist, firstEntryPt, firstOutTangent);
+            const firstEntryDirs = getPointEndDirs(
+              firstEntryPt,
+              firstOutTangent,
+              srcLeadPt ?? startPort,
+              entryAlongsideSet.has(firstEntryKey)
+            );
+
+            const lastStepIdx = totalSteps - 1;
+            const lastStepMeta = item.corridorChain[lastStepIdx];
+            const lastStep = anchoredSteps[lastStepIdx];
+            const lastExitPt = lastStep[lastStep.length - 1];
+            const lastOutTangent = getCorridorMouthVectors(lastStepMeta.corridor, lastStepMeta.isReversed).outTangent;
+            const lastExitKey = makeStepKey(item.link.id, lastStepIdx);
+            const tgtLeadPt = computeSafeSocketLeadPt(endPort, item.tDir, rawTgtLeadDist, lastExitPt, lastOutTangent);
+            const lastExitDirs = getPointEndDirs(
+              lastExitPt,
+              lastOutTangent,
+              tgtLeadPt ?? endPort,
+              exitAlongsideSet.has(lastExitKey)
+            );
+
+            const entryConn = router.addConnector(
+              srcLeadPt
+                ? { x: srcLeadPt.x, y: srcLeadPt.y, directions: getLeadDepartureDirs(item.sDir) }
+                : { shape: srcShape, pin: srcPinId },
+              { x: firstEntryPt.x, y: firstEntryPt.y, directions: firstEntryDirs }
+            );
+
+            const bridgeConns: (ReturnType<typeof router.addConnector> | null)[] = [];
+            for (let s = 0; s < totalSteps - 1; s++) {
+              const curExit = anchoredSteps[s][anchoredSteps[s].length - 1];
+              const nextEntry = anchoredSteps[s + 1][0];
+              if (Math.hypot(nextEntry.x - curExit.x, nextEntry.y - curExit.y) < 1) {
+                bridgeConns.push(null);
+              } else {
+                const curMeta = item.corridorChain[s];
+                const nextMeta = item.corridorChain[s + 1];
+                const curOutTangent = getCorridorMouthVectors(curMeta.corridor, curMeta.isReversed).outTangent;
+                const nextOutTangent = getCorridorMouthVectors(nextMeta.corridor, !nextMeta.isReversed).outTangent;
+                const curExitDirs = getPointEndDirs(curExit, curOutTangent, nextEntry, false);
+                const nextEntryDirs = getPointEndDirs(nextEntry, nextOutTangent, curExit, false);
+
+                bridgeConns.push(
+                  router.addConnector(
+                    { x: curExit.x, y: curExit.y, directions: curExitDirs },
+                    { x: nextEntry.x, y: nextEntry.y, directions: nextEntryDirs }
+                  )
                 );
               }
-              combined.push(...bridgePts.slice(1));
             }
-          });
-          combined.push(...exitPts.slice(1));
 
-          points = simplifyCollinear(combined);
-        } else {
-          if (directConn && directConn.hasValidRoute()) {
-            const routePts = directConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
-            points = routePts.length >= 2 ? simplifyCollinear(routePts) : buildFallbackPoints(startPort, endPort, item.sDir, item.tDir);
+            const exitConn = router.addConnector(
+              { x: lastExitPt.x, y: lastExitPt.y, directions: lastExitDirs },
+              tgtLeadPt
+                ? { x: tgtLeadPt.x, y: tgtLeadPt.y, directions: getLeadDepartureDirs(item.tDir) }
+                : { shape: tgtShape, pin: tgtPinId }
+            );
+
+            pendingConnectors.push({
+              item,
+              startPort,
+              endPort,
+              srcLeadPt,
+              tgtLeadPt,
+              anchoredSteps,
+              directConn: null,
+              entryConn,
+              bridgeConns,
+              exitConn
+            });
           } else {
-            points = buildFallbackPoints(startPort, endPort, item.sDir, item.tDir);
+            const skipLeads = shouldSkipDirectLeadsForStraightGap(
+              startPort,
+              endPort,
+              item.sDir,
+              item.tDir,
+              rawSrcLeadDist + rawTgtLeadDist
+            );
+            const srcLeadPt = skipLeads ? null : computeSafeSocketLeadPt(startPort, item.sDir, rawSrcLeadDist, endPort);
+            const tgtLeadPt = skipLeads ? null : computeSafeSocketLeadPt(endPort, item.tDir, rawTgtLeadDist, startPort);
+            const directConn = router.addConnector(
+              srcLeadPt
+                ? { x: srcLeadPt.x, y: srcLeadPt.y, directions: getLeadDepartureDirs(item.sDir) }
+                : { shape: srcShape, pin: srcPinId },
+              tgtLeadPt
+                ? { x: tgtLeadPt.x, y: tgtLeadPt.y, directions: getLeadDepartureDirs(item.tDir) }
+                : { shape: tgtShape, pin: tgtPinId }
+            );
+            pendingConnectors.push({
+              item,
+              startPort,
+              endPort,
+              srcLeadPt,
+              tgtLeadPt,
+              directConn,
+              entryConn: null,
+              bridgeConns: [],
+              exitConn: null
+            });
+          }
+        });
+
+        router.processTransaction();
+
+        pendingConnectors.forEach(({ item, startPort, endPort, srcLeadPt, tgtLeadPt, anchoredSteps, directConn, entryConn, bridgeConns, exitConn }) => {
+          leadsByLink.set(item.link.id, { srcLeadPt, tgtLeadPt });
+          const corridorSegments: { p1: Point; p2: Point }[] = [];
+          let points: Point[];
+
+          if (anchoredSteps && anchoredSteps.length > 0 && item.corridorChain) {
+            const firstEntryPt = anchoredSteps[0][0];
+            const lastStepIdx = anchoredSteps.length - 1;
+            const lastStep = anchoredSteps[lastStepIdx];
+            const lastExitPt = lastStep[lastStep.length - 1];
+            const firstOut = getCorridorMouthVectors(item.corridorChain[0].corridor, !item.corridorChain[0].isReversed).outTangent;
+            const lastOut = getCorridorMouthVectors(item.corridorChain[lastStepIdx].corridor, item.corridorChain[lastStepIdx].isReversed).outTangent;
+
+            let entryPts: Point[];
+            if (entryConn && entryConn.hasValidRoute()) {
+              const r = entryConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
+              entryPts =
+                r.length >= 2 || (srcLeadPt && r.length >= 1)
+                  ? (srcLeadPt ? [startPort, ...r] : r)
+                  : (srcLeadPt
+                      ? [startPort, ...buildFallbackPoints(srcLeadPt, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut))]
+                      : buildFallbackPoints(startPort, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut)));
+            } else {
+              entryPts = srcLeadPt
+                ? [startPort, ...buildFallbackPoints(srcLeadPt, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut))]
+                : buildFallbackPoints(startPort, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut));
+            }
+
+            let exitPts: Point[];
+            if (exitConn && exitConn.hasValidRoute()) {
+              const r = exitConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
+              exitPts =
+                r.length >= 2 || (tgtLeadPt && r.length >= 1)
+                  ? (tgtLeadPt ? [...r, endPort] : r)
+                  : (tgtLeadPt
+                      ? [...buildFallbackPoints(lastExitPt, tgtLeadPt, outTangentToArrivalDir(lastOut), item.tDir), endPort]
+                      : buildFallbackPoints(lastExitPt, endPort, outTangentToArrivalDir(lastOut), item.tDir));
+            } else {
+              exitPts = tgtLeadPt
+                ? [...buildFallbackPoints(lastExitPt, tgtLeadPt, outTangentToArrivalDir(lastOut), item.tDir), endPort]
+                : buildFallbackPoints(lastExitPt, endPort, outTangentToArrivalDir(lastOut), item.tDir);
+            }
+
+            const combined: Point[] = [...entryPts];
+            anchoredSteps.forEach((stepPts, sIdx) => {
+              for (let i = 0; i < stepPts.length - 1; i++) {
+                corridorSegments.push({ p1: stepPts[i], p2: stepPts[i + 1] });
+              }
+              combined.push(...stepPts.slice(1));
+
+              if (sIdx < anchoredSteps.length - 1) {
+                const curExit = stepPts[stepPts.length - 1];
+                const nextEntry = anchoredSteps[sIdx + 1][0];
+                const curOut = getCorridorMouthVectors(item.corridorChain![sIdx].corridor, item.corridorChain![sIdx].isReversed).outTangent;
+                const nextOut = getCorridorMouthVectors(item.corridorChain![sIdx + 1].corridor, !item.corridorChain![sIdx + 1].isReversed).outTangent;
+                const bridgeConn = bridgeConns[sIdx];
+                let bridgePts: Point[];
+                if (bridgeConn && bridgeConn.hasValidRoute()) {
+                  const r = bridgeConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
+                  bridgePts =
+                    r.length >= 2
+                      ? r
+                      : buildFallbackPoints(
+                          curExit,
+                          nextEntry,
+                          outTangentToArrivalDir(curOut),
+                          outTangentToArrivalDir(nextOut)
+                        );
+                } else if (Math.hypot(nextEntry.x - curExit.x, nextEntry.y - curExit.y) < 1) {
+                  bridgePts = [curExit, nextEntry];
+                } else {
+                  bridgePts = buildFallbackPoints(
+                    curExit,
+                    nextEntry,
+                    outTangentToArrivalDir(curOut),
+                    outTangentToArrivalDir(nextOut)
+                  );
+                }
+                combined.push(...bridgePts.slice(1));
+              }
+            });
+            combined.push(...exitPts.slice(1));
+
+            points = simplifyCollinear(combined);
+          } else {
+            if (directConn && directConn.hasValidRoute()) {
+              const routePts = directConn.displayRoute().map((p) => ({ x: p.x, y: p.y }));
+              const hasEnoughPts =
+                routePts.length >= 2 || ((srcLeadPt !== null || tgtLeadPt !== null) && routePts.length >= 1);
+              if (hasEnoughPts) {
+                const assembled: Point[] = [];
+                if (srcLeadPt) assembled.push(startPort);
+                assembled.push(...routePts);
+                if (tgtLeadPt) assembled.push(endPort);
+                points = simplifyCollinear(assembled);
+              } else {
+                const mid = buildFallbackPoints(srcLeadPt ?? startPort, tgtLeadPt ?? endPort, item.sDir, item.tDir);
+                points = simplifyCollinear([
+                  ...(srcLeadPt ? [startPort] : []),
+                  ...mid,
+                  ...(tgtLeadPt ? [endPort] : [])
+                ]);
+              }
+            } else {
+              const mid = buildFallbackPoints(srcLeadPt ?? startPort, tgtLeadPt ?? endPort, item.sDir, item.tDir);
+              points = simplifyCollinear([
+                ...(srcLeadPt ? [startPort] : []),
+                ...mid,
+                ...(tgtLeadPt ? [endPort] : [])
+              ]);
+            }
+          }
+
+          passRoutes.push({
+            link: item.link,
+            source: item.source,
+            target: item.target,
+            points,
+            startPort,
+            endPort,
+            sDir: item.sDir,
+            tDir: item.tDir,
+            corridorSegments
+          });
+        });
+      } finally {
+        router.delete();
+      }
+      return { passRoutes, leadsByLink };
+    };
+
+    const isSegOnCorridor = (p1: Point, p2: Point, corrSegs: { p1: Point; p2: Point }[]): boolean => {
+      if (corrSegs.length === 0) return false;
+      const midX = (p1.x + p2.x) / 2;
+      const midY = (p1.y + p2.y) / 2;
+      return corrSegs.some((c) => {
+        const minX = Math.min(c.p1.x, c.p2.x) - 1;
+        const maxX = Math.max(c.p1.x, c.p2.x) + 1;
+        const minY = Math.min(c.p1.y, c.p2.y) - 1;
+        const maxY = Math.max(c.p1.y, c.p2.y) + 1;
+        return midX >= minX && midX <= maxX && midY >= minY && midY <= maxY;
+      });
+    };
+
+    const ptNear = (a: Point, b: Point | null): boolean =>
+      b !== null && Math.hypot(a.x - b.x, a.y - b.y) < 1;
+
+    let finalPassRoutes: TempRoute[] = [];
+    for (let pass = 0; pass < 3; pass++) {
+      const { passRoutes, leadsByLink } = runWasmRoutingPass();
+      finalPassRoutes = passRoutes;
+      if (pass >= 2) break;
+
+      let adjustedLead = false;
+      for (let i = 0; i < passRoutes.length && !adjustedLead; i++) {
+        const rA = passRoutes[i];
+        const leadsA = leadsByLink.get(rA.link.id);
+        for (let j = i + 1; j < passRoutes.length && !adjustedLead; j++) {
+          const rB = passRoutes[j];
+          const leadsB = leadsByLink.get(rB.link.id);
+          for (let a = 0; a < rA.points.length - 1 && !adjustedLead; a++) {
+            const a1 = rA.points[a];
+            const a2 = rA.points[a + 1];
+            if (isSegOnCorridor(a1, a2, rA.corridorSegments)) continue;
+            const aH = Math.abs(a1.y - a2.y) < 0.5;
+            const aV = Math.abs(a1.x - a2.x) < 0.5;
+            if (!aH && !aV) continue;
+
+            for (let b = 0; b < rB.points.length - 1 && !adjustedLead; b++) {
+              const b1 = rB.points[b];
+              const b2 = rB.points[b + 1];
+              if (isSegOnCorridor(b1, b2, rB.corridorSegments)) continue;
+              const bH = Math.abs(b1.y - b2.y) < 0.5;
+              const bV = Math.abs(b1.x - b2.x) < 0.5;
+              if (aH !== bH || aV !== bV) continue;
+
+              const ov = aH
+                ? Math.abs(a1.y - b1.y) < 2
+                  ? Math.min(Math.max(a1.x, a2.x), Math.max(b1.x, b2.x)) -
+                    Math.max(Math.min(a1.x, a2.x), Math.min(b1.x, b2.x))
+                  : 0
+                : Math.abs(a1.x - b1.x) < 2
+                ? Math.min(Math.max(a1.y, a2.y), Math.max(b1.y, b2.y)) -
+                  Math.max(Math.min(a1.y, a2.y), Math.min(b1.y, b2.y))
+                : 0;
+              if (ov <= 0.5) continue;
+
+              const aLen = Math.hypot(a2.x - a1.x, a2.y - a1.y);
+              const bLen = Math.hypot(b2.x - b1.x, b2.y - b1.y);
+              const aTouchesTgt = leadsA && (ptNear(a1, leadsA.tgtLeadPt) || ptNear(a2, leadsA.tgtLeadPt));
+              const bTouchesTgt = leadsB && (ptNear(b1, leadsB.tgtLeadPt) || ptNear(b2, leadsB.tgtLeadPt));
+              const aTouchesSrc = leadsA && (ptNear(a1, leadsA.srcLeadPt) || ptNear(a2, leadsA.srcLeadPt));
+              const bTouchesSrc = leadsB && (ptNear(b1, leadsB.srcLeadPt) || ptNear(b2, leadsB.srcLeadPt));
+
+              if (aTouchesTgt && (!bTouchesTgt || aLen >= bLen)) {
+                tgtLeadDists.set(rA.link.id, (tgtLeadDists.get(rA.link.id) ?? MIN_SOCKET_LEAD) + LANE_SPACING);
+                adjustedLead = true;
+              } else if (bTouchesTgt) {
+                tgtLeadDists.set(rB.link.id, (tgtLeadDists.get(rB.link.id) ?? MIN_SOCKET_LEAD) + LANE_SPACING);
+                adjustedLead = true;
+              } else if (aTouchesSrc && (!bTouchesSrc || aLen >= bLen)) {
+                srcLeadDists.set(rA.link.id, (srcLeadDists.get(rA.link.id) ?? MIN_SOCKET_LEAD) + LANE_SPACING);
+                adjustedLead = true;
+              } else if (bTouchesSrc) {
+                srcLeadDists.set(rB.link.id, (srcLeadDists.get(rB.link.id) ?? MIN_SOCKET_LEAD) + LANE_SPACING);
+                adjustedLead = true;
+              }
+            }
           }
         }
-
-        tempRoutes.push({
-          link: item.link,
-          source: item.source,
-          target: item.target,
-          points,
-          startPort,
-          endPort,
-          corridorSegments
-        });
-      });
-    } finally {
-      router.delete();
+      }
+      if (!adjustedLead) break;
     }
+
+    tempRoutes.push(...finalPassRoutes);
   } else {
     validLinks.forEach((item) => {
       const srcOffset = srcLaneOffsets.get(item.link.id) || 0;
       const tgtOffset = tgtLaneOffsets.get(item.link.id) || 0;
       const startPort = getPortWithLaneOffset(item.source, item.sDir, srcOffset);
       const endPort = getPortWithLaneOffset(item.target, item.tDir, tgtOffset);
+      const rawSrcLeadDist = srcLeadDists.get(item.link.id) ?? MIN_SOCKET_LEAD;
+      const rawTgtLeadDist = tgtLeadDists.get(item.link.id) ?? MIN_SOCKET_LEAD;
       const corridorSegments: { p1: Point; p2: Point }[] = [];
 
       let points: Point[];
@@ -1558,8 +2035,14 @@ export const computeAllLinkRoutes = (
         const firstOut = getCorridorMouthVectors(item.corridorChain[0].corridor, !item.corridorChain[0].isReversed).outTangent;
         const lastOut = getCorridorMouthVectors(item.corridorChain[lastStepIdx].corridor, item.corridorChain[lastStepIdx].isReversed).outTangent;
 
-        const entryPts = buildFallbackPoints(startPort, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut));
-        const exitPts = buildFallbackPoints(lastExitPt, endPort, outTangentToArrivalDir(lastOut), item.tDir);
+        const srcLeadPt = computeSafeSocketLeadPt(startPort, item.sDir, rawSrcLeadDist, firstEntryPt);
+        const tgtLeadPt = computeSafeSocketLeadPt(endPort, item.tDir, rawTgtLeadDist, lastExitPt);
+        const entryPts = srcLeadPt
+          ? [startPort, ...buildFallbackPoints(srcLeadPt, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut))]
+          : buildFallbackPoints(startPort, firstEntryPt, item.sDir, outTangentToArrivalDir(firstOut));
+        const exitPts = tgtLeadPt
+          ? [...buildFallbackPoints(lastExitPt, tgtLeadPt, outTangentToArrivalDir(lastOut), item.tDir), endPort]
+          : buildFallbackPoints(lastExitPt, endPort, outTangentToArrivalDir(lastOut), item.tDir);
 
         const combined: Point[] = [...entryPts];
         anchoredSteps.forEach((stepPts, sIdx) => {
@@ -1584,7 +2067,21 @@ export const computeAllLinkRoutes = (
         combined.push(...exitPts.slice(1));
         points = simplifyCollinear(combined);
       } else {
-        points = buildFallbackPoints(startPort, endPort, item.sDir, item.tDir);
+        const skipLeads = shouldSkipDirectLeadsForStraightGap(
+          startPort,
+          endPort,
+          item.sDir,
+          item.tDir,
+          rawSrcLeadDist + rawTgtLeadDist
+        );
+        const srcLeadPt = skipLeads ? null : computeSafeSocketLeadPt(startPort, item.sDir, rawSrcLeadDist, endPort);
+        const tgtLeadPt = skipLeads ? null : computeSafeSocketLeadPt(endPort, item.tDir, rawTgtLeadDist, startPort);
+        const mid = buildFallbackPoints(srcLeadPt ?? startPort, tgtLeadPt ?? endPort, item.sDir, item.tDir);
+        points = simplifyCollinear([
+          ...(srcLeadPt ? [startPort] : []),
+          ...mid,
+          ...(tgtLeadPt ? [endPort] : [])
+        ]);
       }
 
       tempRoutes.push({
@@ -1594,6 +2091,8 @@ export const computeAllLinkRoutes = (
         points,
         startPort,
         endPort,
+        sDir: item.sDir,
+        tDir: item.tDir,
         corridorSegments
       });
     });
@@ -1906,12 +2405,30 @@ export const computeAllLinkRoutes = (
       points: route.points,
       startPort: route.startPort,
       endPort: route.endPort,
-      badgePt
+      badgePt,
+      sDir: route.sDir,
+      tDir: route.tDir
     });
   });
 
   cachedTopologyKey = topologyKey;
   cachedRoutes = resultMap;
   return resultMap;
+};
+
+export const getEffectiveContainerOutputEdge = (
+  node: ContainerNode,
+  nodesList: ContainerNode[],
+  linksList: TransferLink[],
+  corridorsList: RouteCorridor[] = []
+): CardinalEdge => {
+  if (node.outputEdge) return node.outputEdge;
+  const routes = computeAllLinkRoutes(nodesList, linksList, corridorsList);
+  const firstOutgoing = linksList.find((l) => l.sourceId === node.id);
+  if (firstOutgoing) {
+    const r = routes.get(firstOutgoing.id);
+    if (r) return r.sDir;
+  }
+  return 'E';
 };
 

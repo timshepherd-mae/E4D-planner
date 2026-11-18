@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { ContainerNode, TransferLink, RouteCorridor, SimFrame, FlowStatus, GRAPH_LINE_COLORS, getLinkCorridorIds } from '../../models/types';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
-import { initPipeRouter, isPipeRouterReady, computeAllLinkRoutes } from './pipeRouter';
+import { initPipeRouter, isPipeRouterReady, computeAllLinkRoutes, getEffectiveContainerOutputEdge } from './pipeRouter';
 
 interface Point { x: number; y: number; }
 
@@ -693,7 +693,7 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         const angle0 = Math.atan2(p1.y - p0.y, p1.x - p0.x);
         const seg0Len = Math.hypot(p1.x - p0.x, p1.y - p0.y);
         if (seg0Len > 5) {
-          const dist = Math.min(startArrowOffset, seg0Len / 2);
+          const dist = Math.min(startArrowOffset, seg0Len / 2 + 21);
           drawArrowHead(ctx, p0.x + Math.cos(angle0) * dist, p0.y + Math.sin(angle0) * dist, angle0, linkColor);
         }
 
@@ -863,6 +863,34 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
           ctx.stroke();
         }
         ctx.restore();
+
+        // Draw output socket edge indicator when container is selected (Edit Mode)
+        if (isSelected && !isPlayback) {
+          const activeOutEdge = getEffectiveContainerOutputEdge(node, nodes, links, corridors);
+          const socketCenter =
+            activeOutEdge === 'N'
+              ? { x: node.x + width / 2, y: node.y, angle: -Math.PI / 2 }
+              : activeOutEdge === 'S'
+              ? { x: node.x + width / 2, y: node.y + height, angle: Math.PI / 2 }
+              : activeOutEdge === 'W'
+              ? { x: node.x, y: node.y + height / 2, angle: Math.PI }
+              : { x: node.x + width, y: node.y + height / 2, angle: 0 };
+
+          ctx.save();
+          ctx.translate(socketCenter.x, socketCenter.y);
+          ctx.rotate(socketCenter.angle);
+          ctx.fillStyle = '#38bdf8';
+          ctx.strokeStyle = '#0f172a';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(-2, -6);
+          ctx.lineTo(7, 0);
+          ctx.lineTo(-2, 6);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+        }
       });
 
       // 5. Draw Selected Route Corridor Edit Handles (only when 1 corridor is selected)
