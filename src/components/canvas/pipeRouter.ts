@@ -329,47 +329,105 @@ const buildFallbackPoints = (
   return simplifyCollinear(rawPoints);
 };
 
-const isSegmentSharedInCorridor = (
-  segA: { p1: Point; p2: Point },
-  currentLinkId: string,
-  allRoutes: { linkId: string; points: Point[] }[]
+const clipSegmentToExpandedRect = (
+  p1: Point,
+  p2: Point,
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number
 ): boolean => {
-  const isVertA = Math.abs(segA.p1.x - segA.p2.x) < 0.5;
-  const isHorizA = Math.abs(segA.p1.y - segA.p2.y) < 0.5;
-  const lenA = Math.hypot(segA.p2.x - segA.p1.x, segA.p2.y - segA.p1.y);
-  if (lenA < 5) return false;
+  let t0 = 0;
+  let t1 = 1;
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
 
-  for (const other of allRoutes) {
-    if (other.linkId === currentLinkId) continue;
-    for (let j = 0; j < other.points.length - 1; j++) {
-      const segB = { p1: other.points[j], p2: other.points[j + 1] };
-      const isVertB = Math.abs(segB.p1.x - segB.p2.x) < 0.5;
-      const isHorizB = Math.abs(segB.p1.y - segB.p2.y) < 0.5;
+  const clip = (p: number, q: number): boolean => {
+    if (Math.abs(p) < 1e-9) return q >= 0;
+    const r = q / p;
+    if (p < 0) {
+      if (r > t1) return false;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return false;
+      if (r < t1) t1 = r;
+    }
+    return true;
+  };
 
-      if (isVertA && isVertB) {
-        const dx = Math.abs(segA.p1.x - segB.p1.x);
-        if (dx <= 24) {
-          const minY1 = Math.min(segA.p1.y, segA.p2.y);
-          const maxY1 = Math.max(segA.p1.y, segA.p2.y);
-          const minY2 = Math.min(segB.p1.y, segB.p2.y);
-          const maxY2 = Math.max(segB.p1.y, segB.p2.y);
-          const overlap = Math.min(maxY1, maxY2) - Math.max(minY1, minY2);
-          if (overlap >= 25) return true;
-        }
-      } else if (isHorizA && isHorizB) {
-        const dy = Math.abs(segA.p1.y - segB.p1.y);
-        if (dy <= 24) {
-          const minX1 = Math.min(segA.p1.x, segA.p2.x);
-          const maxX1 = Math.max(segA.p1.x, segA.p2.x);
-          const minX2 = Math.min(segB.p1.x, segB.p2.x);
-          const maxX2 = Math.max(segB.p1.x, segB.p2.x);
-          const overlap = Math.min(maxX1, maxX2) - Math.max(minX1, minX2);
-          if (overlap >= 25) return true;
-        }
-      }
+  return (
+    clip(-dx, p1.x - minX) &&
+    clip(dx, maxX - p1.x) &&
+    clip(-dy, p1.y - minY) &&
+    clip(dy, maxY - p1.y) &&
+    t0 <= t1
+  );
+};
+
+const subtractIntervalFromList = (
+  intervals: [number, number][],
+  cutStart: number,
+  cutEnd: number
+): [number, number][] => {
+  if (cutEnd <= cutStart) return intervals;
+  const next: [number, number][] = [];
+  for (const [a, b] of intervals) {
+    if (cutEnd <= a || cutStart >= b) {
+      next.push([a, b]);
+    } else {
+      if (cutStart > a + 1e-4) next.push([a, cutStart]);
+      if (cutEnd < b - 1e-4) next.push([cutEnd, b]);
     }
   }
-  return false;
+  return next;
+};
+
+const subtractOverlappingSegments = (
+  baseIntervals: [number, number][],
+  segP1: Point,
+  segP2: Point,
+  blockers: { p1: Point; p2: Point; tol: number }[]
+): [number, number][] => {
+  const dx = segP2.x - segP1.x;
+  const dy = segP2.y - segP1.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return [];
+
+  const ux = dx / len;
+  const uy = dy / len;
+  const nx = -uy;
+  const ny = ux;
+
+  let result = baseIntervals.slice();
+  const padT = Math.min(0.08, 4 / len);
+
+  for (const blk of blockers) {
+    if (result.length === 0) break;
+    const bx = blk.p2.x - blk.p1.x;
+    const by = blk.p2.y - blk.p1.y;
+    const bLen = Math.hypot(bx, by);
+    if (bLen < 1) continue;
+
+    const bux = bx / bLen;
+    const buy = by / bLen;
+    // Must be parallel / collinear (within ~25 deg)
+    if (Math.abs(ux * bux + uy * buy) < 0.9) continue;
+
+    const bMidX = (blk.p1.x + blk.p2.x) / 2;
+    const bMidY = (blk.p1.y + blk.p2.y) / 2;
+    const perpDist = Math.abs((bMidX - segP1.x) * nx + (bMidY - segP1.y) * ny);
+    if (perpDist > blk.tol) continue;
+
+    const t1 = ((blk.p1.x - segP1.x) * ux + (blk.p1.y - segP1.y) * uy) / len;
+    const t2 = ((blk.p2.x - segP1.x) * ux + (blk.p2.y - segP1.y) * uy) / len;
+    const lo = Math.max(0, Math.min(t1, t2) - padT);
+    const hi = Math.min(1, Math.max(t1, t2) + padT);
+    if (hi > lo + 1e-4) {
+      result = subtractIntervalFromList(result, lo, hi);
+    }
+  }
+
+  return result;
 };
 
 const computeTopologyKey = (
@@ -1163,7 +1221,7 @@ export const computeAllLinkRoutes = (
     points: Point[];
     startPort: Point;
     endPort: Point;
-    corridorWaypointsSet: Set<string>;
+    corridorSegments: { p1: Point; p2: Point }[];
   }
 
   const tempRoutes: TempRoute[] = [];
@@ -1389,7 +1447,7 @@ export const computeAllLinkRoutes = (
       router.processTransaction();
 
       pendingConnectors.forEach(({ item, startPort, endPort, anchoredSteps, directConn, entryConn, bridgeConns, exitConn }) => {
-        const corridorWaypointsSet = new Set<string>();
+        const corridorSegments: { p1: Point; p2: Point }[] = [];
         let points: Point[];
 
         if (anchoredSteps && anchoredSteps.length > 0 && item.corridorChain) {
@@ -1419,9 +1477,7 @@ export const computeAllLinkRoutes = (
           const combined: Point[] = [...entryPts];
           anchoredSteps.forEach((stepPts, sIdx) => {
             for (let i = 0; i < stepPts.length - 1; i++) {
-              corridorWaypointsSet.add(
-                `${Math.round(stepPts[i].x)},${Math.round(stepPts[i].y)}->${Math.round(stepPts[i + 1].x)},${Math.round(stepPts[i + 1].y)}`
-              );
+              corridorSegments.push({ p1: stepPts[i], p2: stepPts[i + 1] });
             }
             combined.push(...stepPts.slice(1));
 
@@ -1475,7 +1531,7 @@ export const computeAllLinkRoutes = (
           points,
           startPort,
           endPort,
-          corridorWaypointsSet
+          corridorSegments
         });
       });
     } finally {
@@ -1487,7 +1543,7 @@ export const computeAllLinkRoutes = (
       const tgtOffset = tgtLaneOffsets.get(item.link.id) || 0;
       const startPort = getPortWithLaneOffset(item.source, item.sDir, srcOffset);
       const endPort = getPortWithLaneOffset(item.target, item.tDir, tgtOffset);
-      const corridorWaypointsSet = new Set<string>();
+      const corridorSegments: { p1: Point; p2: Point }[] = [];
 
       let points: Point[];
       if (item.corridorChain && item.corridorChain.length > 0) {
@@ -1508,9 +1564,7 @@ export const computeAllLinkRoutes = (
         const combined: Point[] = [...entryPts];
         anchoredSteps.forEach((stepPts, sIdx) => {
           for (let i = 0; i < stepPts.length - 1; i++) {
-            corridorWaypointsSet.add(
-              `${Math.round(stepPts[i].x)},${Math.round(stepPts[i].y)}->${Math.round(stepPts[i + 1].x)},${Math.round(stepPts[i + 1].y)}`
-            );
+            corridorSegments.push({ p1: stepPts[i], p2: stepPts[i + 1] });
           }
           combined.push(...stepPts.slice(1));
           if (sIdx < anchoredSteps.length - 1) {
@@ -1540,13 +1594,117 @@ export const computeAllLinkRoutes = (
         points,
         startPort,
         endPort,
-        corridorWaypointsSet
+        corridorSegments
       });
     });
   }
 
-  // 5. Calculate badge positions away from shared corridors & tight route corridor trunks
-  const allRouteSummaries = tempRoutes.map((r) => ({ linkId: r.link.id, points: r.points }));
+  // 5. Calculate offline badge positions next to unique (non-shared, non-corridor) segments
+  const BADGE_W = 50;
+  const BADGE_H = 20;
+  const BADGE_CLEARANCE = 8;
+
+  interface RectBox {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+  }
+
+  const rectsOverlap = (a: RectBox, b: RectBox, pad = 0): boolean =>
+    a.minX < b.maxX + pad &&
+    a.maxX > b.minX - pad &&
+    a.minY < b.maxY + pad &&
+    a.maxY > b.minY - pad;
+
+  const nodeRects: RectBox[] = nodesList.map((n) => ({
+    minX: n.x,
+    maxX: n.x + CARD_W,
+    minY: n.y,
+    maxY: n.y + CARD_H
+  }));
+
+  const assignedCorridorCounts = new Map<string, number>();
+  linksList.forEach((l) => {
+    getLinkCorridorIds(l).forEach((cid) => {
+      assignedCorridorCounts.set(cid, (assignedCorridorCounts.get(cid) || 0) + 1);
+    });
+  });
+
+  const corridorBandObstacles: { p1: Point; p2: Point; tol: number }[] = [];
+  const corridorUiRects: RectBox[] = [];
+
+  corridorsList.forEach((corridor) => {
+    const wps = corridor.waypoints;
+    if (!wps || wps.length < 2) return;
+    const assignedCount = assignedCorridorCounts.get(corridor.id) || 0;
+    const spacing = Math.max(2, corridor.laneSpacing || 5);
+    const bandWidth = Math.max(28, Math.max(0, assignedCount - 1) * spacing + 24);
+    const halfBand = bandWidth / 2;
+
+    let longestIdx = 0;
+    let longestLen = -1;
+    for (let i = 0; i < wps.length - 1; i++) {
+      corridorBandObstacles.push({ p1: wps[i], p2: wps[i + 1], tol: halfBand + 4 });
+      const segLen = Math.hypot(wps[i + 1].x - wps[i].x, wps[i + 1].y - wps[i].y);
+      if (segLen > longestLen) {
+        longestLen = segLen;
+        longestIdx = i;
+      }
+    }
+
+    if (longestLen > 1) {
+      const segA = wps[longestIdx];
+      const segB = wps[longestIdx + 1];
+      let angle = Math.atan2(segB.y - segA.y, segB.x - segA.x);
+      if (angle >= Math.PI / 2) angle -= Math.PI;
+      else if (angle < -Math.PI / 2) angle += Math.PI;
+
+      const cos = Math.abs(Math.cos(angle));
+      const sin = Math.abs(Math.sin(angle));
+
+      if (corridor.name) {
+        const labelW = Math.max(36, corridor.name.length * 6.5 + 16);
+        const labelH = 20;
+        const labelDist = halfBand + 11;
+        const lx = (segA.x + segB.x) / 2 + Math.sin(angle) * labelDist;
+        const ly = (segA.y + segB.y) / 2 - Math.cos(angle) * labelDist;
+        const halfAabbW = (cos * labelW + sin * labelH) / 2;
+        const halfAabbH = (sin * labelW + cos * labelH) / 2;
+        corridorUiRects.push({
+          minX: lx - halfAabbW,
+          maxX: lx + halfAabbW,
+          minY: ly - halfAabbH,
+          maxY: ly + halfAabbH
+        });
+      }
+
+      const oppNormX = -Math.sin(angle);
+      const oppNormY = Math.cos(angle);
+      const rBadgeW = 54;
+      const rBadgeH = 20;
+      const projHalf = Math.abs(oppNormX) * (rBadgeW / 2) + Math.abs(oppNormY) * (rBadgeH / 2);
+      const badgeDist = halfBand + projHalf + 5;
+      const bx = (segA.x + segB.x) / 2 + oppNormX * badgeDist;
+      const by = (segA.y + segB.y) / 2 + oppNormY * badgeDist;
+      corridorUiRects.push({
+        minX: bx - rBadgeW / 2,
+        maxX: bx + rBadgeW / 2,
+        minY: by - rBadgeH / 2,
+        maxY: by + rBadgeH / 2
+      });
+    }
+  });
+
+  const allLinkSegs = tempRoutes.map((r) => {
+    const segs: { p1: Point; p2: Point; tol: number }[] = [];
+    for (let i = 0; i < r.points.length - 1; i++) {
+      segs.push({ p1: r.points[i], p2: r.points[i + 1], tol: 24 });
+    }
+    return { linkId: r.link.id, segs };
+  });
+
+  const placedBadgeRects: RectBox[] = [];
 
   tempRoutes.forEach((route, linkIdx) => {
     const points = route.points;
@@ -1554,63 +1712,190 @@ export const computeAllLinkRoutes = (
 
     if (points.length <= 1) {
       badgePt = points[0] || { x: 0, y: 0 };
-    } else if (points.length === 2) {
-      badgePt = {
-        x: (points[0].x + points[1].x) / 2,
-        y: (points[0].y + points[1].y) / 2
-      };
     } else {
-      interface SegCandidate {
-        index: number;
-        p1: Point;
-        p2: Point;
-        length: number;
-        isShared: boolean;
-        inCorridor: boolean;
+      const ownCorridorBlockers = route.corridorSegments.map((s) => ({ p1: s.p1, p2: s.p2, tol: 8 }));
+      const corridorBlockers = [...ownCorridorBlockers, ...corridorBandObstacles];
+      const siblingLinkBlockers: { p1: Point; p2: Point; tol: number }[] = [];
+      allLinkSegs.forEach((other) => {
+        if (other.linkId !== route.link.id) {
+          siblingLinkBlockers.push(...other.segs);
+        }
+      });
+
+      interface OfflineCandidate {
+        segIdx: number;
+        segLen: number;
+        subLen: number;
+        t: number;
+        tier: number;
+        isDestSeg: boolean;
       }
 
-      const segments: SegCandidate[] = [];
-      for (let i = 0; i < points.length - 1; i++) {
+      const candidates: OfflineCandidate[] = [];
+      const lastSegIdx = points.length - 2;
+
+      for (let i = 0; i <= lastSegIdx; i++) {
         const p1 = points[i];
         const p2 = points[i + 1];
-        const length = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-        const segKey = `${Math.round(p1.x)},${Math.round(p1.y)}->${Math.round(p2.x)},${Math.round(p2.y)}`;
-        const inCorridor = route.corridorWaypointsSet.has(segKey);
-        const isShared = inCorridor || isSegmentSharedInCorridor({ p1, p2 }, route.link.id, allRouteSummaries);
-        segments.push({ index: i, p1, p2, length, isShared, inCorridor });
+        const segLen = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        if (segLen < 8) continue;
+
+        const isDestSeg = i === lastSegIdx;
+        const nonCorridor = subtractOverlappingSegments([[0, 1]], p1, p2, corridorBlockers);
+
+        let trimmedNonCorridor = nonCorridor;
+        if (i === 0 && segLen > 48) {
+          trimmedNonCorridor = subtractIntervalFromList(trimmedNonCorridor, 0, Math.min(0.42, 24 / segLen));
+        }
+        if (i === lastSegIdx && segLen > 48) {
+          trimmedNonCorridor = subtractIntervalFromList(trimmedNonCorridor, Math.max(0.58, 1 - 24 / segLen), 1);
+        }
+
+        const uniqueTrimmed = subtractOverlappingSegments(trimmedNonCorridor, p1, p2, siblingLinkBlockers);
+        const uniqueUntrimmed = subtractOverlappingSegments(nonCorridor, p1, p2, siblingLinkBlockers);
+
+        const pushIntervals = (intervals: [number, number][], tier: number, minPx: number) => {
+          for (const [a, b] of intervals) {
+            const subLen = (b - a) * segLen;
+            if (subLen < minPx) continue;
+            const midT = (a + b) / 2;
+            candidates.push({ segIdx: i, segLen, subLen, t: midT, tier, isDestSeg });
+            if (subLen >= 40) {
+              candidates.push({ segIdx: i, segLen, subLen, t: a + (b - a) * 0.25, tier, isDestSeg });
+              candidates.push({ segIdx: i, segLen, subLen, t: a + (b - a) * 0.75, tier, isDestSeg });
+            }
+          }
+        };
+
+        // Tier 0: truly unique, outside corridors & away from port arrowheads
+        pushIntervals(uniqueTrimmed, 0, 18);
+        // Tier 1: truly unique, outside corridors (short stub fallback)
+        pushIntervals(uniqueUntrimmed, 1, 8);
+        // Tier 2: outside corridors even if near sibling links (staggered)
+        for (const [a, b] of trimmedNonCorridor.length > 0 ? trimmedNonCorridor : nonCorridor) {
+          const subLen = (b - a) * segLen;
+          if (subLen < 12) continue;
+          const frac = linkIdx % 2 === 0 ? 0.35 : 0.65;
+          candidates.push({ segIdx: i, segLen, subLen, t: a + (b - a) * frac, tier: 2, isDestSeg });
+          candidates.push({ segIdx: i, segLen, subLen, t: a + (b - a) * (1 - frac), tier: 2, isDestSeg });
+        }
+        // Tier 3: last-resort fallback on segment itself
+        candidates.push({
+          segIdx: i,
+          segLen,
+          subLen: segLen,
+          t: linkIdx % 2 === 0 ? 0.35 : 0.65,
+          tier: 3,
+          isDestSeg
+        });
       }
 
-      const destSeg = segments[segments.length - 1];
-      if (!destSeg.isShared && !destSeg.inCorridor && destSeg.length >= 35) {
-        badgePt = {
-          x: (destSeg.p1.x + destSeg.p2.x) / 2,
-          y: (destSeg.p1.y + destSeg.p2.y) / 2
-        };
-      } else {
-        const unshared = segments
-          .filter((s) => !s.isShared && !s.inCorridor && s.length >= 30)
-          .sort((a, b) => b.length - a.length)[0];
+      let bestPt: Point | null = null;
+      let bestCost = Infinity;
+      let bestRect: RectBox | null = null;
 
-        if (unshared) {
-          badgePt = {
-            x: (unshared.p1.x + unshared.p2.x) / 2,
-            y: (unshared.p1.y + unshared.p2.y) / 2
+      for (const cand of candidates) {
+        const p1 = points[cand.segIdx];
+        const p2 = points[cand.segIdx + 1];
+        const ux = (p2.x - p1.x) / cand.segLen;
+        const uy = (p2.y - p1.y) / cand.segLen;
+        const ax = p1.x + (p2.x - p1.x) * cand.t;
+        const ay = p1.y + (p2.y - p1.y) * cand.t;
+
+        const normals: Point[] = [
+          { x: -uy, y: ux },
+          { x: uy, y: -ux }
+        ];
+
+        for (const n of normals) {
+          const projHalf = Math.abs(n.x) * (BADGE_W / 2) + Math.abs(n.y) * (BADGE_H / 2);
+          const offsetDist = projHalf + BADGE_CLEARANCE;
+          const cx = ax + n.x * offsetDist;
+          const cy = ay + n.y * offsetDist;
+          const rect: RectBox = {
+            minX: cx - BADGE_W / 2,
+            maxX: cx + BADGE_W / 2,
+            minY: cy - BADGE_H / 2,
+            maxY: cy + BADGE_H / 2
           };
-        } else {
-          const exteriorLongest = segments
-            .filter((s) => !s.inCorridor && s.length >= 16)
-            .sort((a, b) => b.length - a.length)[0];
-          const chosen = exteriorLongest || segments.slice().sort((a, b) => b.length - a.length)[0];
-          if (chosen) {
-            const t = linkIdx % 2 === 0 ? 0.35 : 0.65;
-            badgePt = {
-              x: chosen.p1.x + (chosen.p2.x - chosen.p1.x) * t,
-              y: chosen.p1.y + (chosen.p2.y - chosen.p1.y) * t
-            };
-          } else {
-            badgePt = { x: points[0].x, y: points[0].y };
+
+          let penalty = 0;
+          for (const nr of nodeRects) {
+            if (rectsOverlap(rect, nr, 4)) {
+              penalty += 10000;
+              break;
+            }
+          }
+          for (const pr of placedBadgeRects) {
+            if (rectsOverlap(rect, pr, 4)) {
+              penalty += 6000;
+              break;
+            }
+          }
+          let hitsLink = false;
+          for (const linkSegGroup of allLinkSegs) {
+            for (const s of linkSegGroup.segs) {
+              if (
+                clipSegmentToExpandedRect(
+                  s.p1,
+                  s.p2,
+                  rect.minX - 3,
+                  rect.maxX + 3,
+                  rect.minY - 3,
+                  rect.maxY + 3
+                )
+              ) {
+                hitsLink = true;
+                break;
+              }
+            }
+            if (hitsLink) break;
+          }
+          if (hitsLink) penalty += 4000;
+
+          for (const cSeg of corridorBandObstacles) {
+            if (
+              clipSegmentToExpandedRect(
+                cSeg.p1,
+                cSeg.p2,
+                rect.minX - cSeg.tol,
+                rect.maxX + cSeg.tol,
+                rect.minY - cSeg.tol,
+                rect.maxY + cSeg.tol
+              )
+            ) {
+              penalty += 3000;
+              break;
+            }
+          }
+          for (const uir of corridorUiRects) {
+            if (rectsOverlap(rect, uir, 3)) {
+              penalty += 2000;
+              break;
+            }
+          }
+
+          const sidePref = n.y < -0.5 ? 0 : n.x > 0.5 ? 1 : n.y > 0.5 ? 2 : 3;
+          const cost =
+            penalty +
+            cand.tier * 1000 +
+            (cand.isDestSeg ? 0 : 80) -
+            Math.min(120, cand.subLen * 0.35) +
+            sidePref * 0.5;
+
+          if (cost < bestCost) {
+            bestCost = cost;
+            bestPt = { x: cx, y: cy };
+            bestRect = rect;
           }
         }
+      }
+
+      if (bestPt && bestRect) {
+        badgePt = bestPt;
+        placedBadgeRects.push(bestRect);
+      } else {
+        badgePt = { x: points[0].x, y: points[0].y - BADGE_H / 2 - BADGE_CLEARANCE };
       }
     }
 

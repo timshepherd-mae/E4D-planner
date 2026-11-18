@@ -276,7 +276,7 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
       ctx.restore();
     }
 
-    const width = Math.max(50, Math.ceil(textWidth) + 14);
+    const width = Math.max(54, Math.ceil(textWidth) + 18);
     const height = 20;
 
     // Opposite unit normal to getCorridorLabelBox's (sin(angle), -cos(angle))
@@ -741,21 +741,28 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         const badgeColor = isPlayback ? getFlowColor(rateMeta.status) : (isSelected ? '#38bdf8' : '#94a3b8');
 
         ctx.save();
+        const left = badgeBox.x - badgeBox.width / 2;
+        const top = badgeBox.y - badgeBox.height / 2;
+        const w = badgeBox.width;
+        const h = badgeBox.height;
+        const cut = 5;
+
+        ctx.beginPath();
+        ctx.moveTo(left + cut, top);
+        ctx.lineTo(left + w - cut, top);
+        ctx.lineTo(left + w, top + cut);
+        ctx.lineTo(left + w, top + h - cut);
+        ctx.lineTo(left + w - cut, top + h);
+        ctx.lineTo(left + cut, top + h);
+        ctx.lineTo(left, top + h - cut);
+        ctx.lineTo(left, top + cut);
+        ctx.closePath();
+
         ctx.fillStyle = !isPlayback && isSelected ? '#0369a1' : '#0f172a';
-        ctx.fillRect(
-          badgeBox.x - badgeBox.width / 2,
-          badgeBox.y - badgeBox.height / 2,
-          badgeBox.width,
-          badgeBox.height
-        );
+        ctx.fill();
         ctx.strokeStyle = badgeColor;
         ctx.lineWidth = isSelected ? 2 : 1.5;
-        ctx.strokeRect(
-          badgeBox.x - badgeBox.width / 2,
-          badgeBox.y - badgeBox.height / 2,
-          badgeBox.width,
-          badgeBox.height
-        );
+        ctx.stroke();
 
         ctx.fillStyle = isPlayback ? badgeColor : '#f8fafc';
         ctx.font = 'bold 11px system-ui, sans-serif';
