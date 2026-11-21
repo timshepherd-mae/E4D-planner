@@ -149,12 +149,15 @@ export const offsetPolyline = (pts: Point[], offset: number): Point[] => {
 const selectBestCardinalFaces = (
   source: ContainerNode,
   target: ContainerNode,
-  forcedSDir?: CardinalDirection
+  forcedSDir?: CardinalDirection,
+  forcedTDir?: CardinalDirection
 ): { sDir: CardinalDirection; tDir: CardinalDirection } => {
   const srcPorts = forcedSDir
     ? getCardinalPorts(source).filter((p) => p.dir === forcedSDir)
     : getCardinalPorts(source);
-  const tgtPorts = getCardinalPorts(target);
+  const tgtPorts = forcedTDir
+    ? getCardinalPorts(target).filter((p) => p.dir === forcedTDir)
+    : getCardinalPorts(target);
 
   const srcCenter = { x: source.x + CARD_W / 2, y: source.y + CARD_H / 2 };
   const tgtCenter = { x: target.x + CARD_W / 2, y: target.y + CARD_H / 2 };
@@ -164,9 +167,11 @@ const selectBestCardinalFaces = (
   let bestScore = -Infinity;
   const defaultAutoSDir: CardinalDirection =
     dx >= dy ? (tgtCenter.x >= srcCenter.x ? 'E' : 'W') : (tgtCenter.y >= srcCenter.y ? 'S' : 'N');
+  const defaultAutoTDir: CardinalDirection =
+    dx >= dy ? (tgtCenter.x >= srcCenter.x ? 'W' : 'E') : (tgtCenter.y >= srcCenter.y ? 'N' : 'S');
   let bestFaces: { sDir: CardinalDirection; tDir: CardinalDirection } = {
     sDir: forcedSDir ?? defaultAutoSDir,
-    tDir: dx >= dy ? (tgtCenter.x >= srcCenter.x ? 'W' : 'E') : (tgtCenter.y >= srcCenter.y ? 'N' : 'S')
+    tDir: forcedTDir ?? defaultAutoTDir
   };
 
   srcPorts.forEach((s) => {
@@ -219,21 +224,40 @@ const selectBestCardinalFaces = (
     });
   });
 
-  if (forcedSDir && bestScore === -Infinity && srcPorts[0]) {
-    const port = srcPorts[0].point;
-    const outVec =
-      forcedSDir === 'N'
-        ? { x: 0, y: -32 }
-        : forcedSDir === 'S'
-        ? { x: 0, y: 32 }
-        : forcedSDir === 'E'
-        ? { x: 32, y: 0 }
-        : { x: -32, y: 0 };
-    const exitHint = { x: port.x + outVec.x, y: port.y + outVec.y };
-    bestFaces = {
-      sDir: forcedSDir,
-      tDir: selectBestTargetFaceFromPoint(exitHint, target)
-    };
+  if (bestScore === -Infinity) {
+    if (forcedSDir && forcedTDir) {
+      bestFaces = { sDir: forcedSDir, tDir: forcedTDir };
+    } else if (forcedSDir && srcPorts[0]) {
+      const port = srcPorts[0].point;
+      const outVec =
+        forcedSDir === 'N'
+          ? { x: 0, y: -32 }
+          : forcedSDir === 'S'
+          ? { x: 0, y: 32 }
+          : forcedSDir === 'E'
+          ? { x: 32, y: 0 }
+          : { x: -32, y: 0 };
+      const exitHint = { x: port.x + outVec.x, y: port.y + outVec.y };
+      bestFaces = {
+        sDir: forcedSDir,
+        tDir: selectBestTargetFaceFromPoint(exitHint, target)
+      };
+    } else if (forcedTDir && tgtPorts[0]) {
+      const port = tgtPorts[0].point;
+      const outVec =
+        forcedTDir === 'N'
+          ? { x: 0, y: -32 }
+          : forcedTDir === 'S'
+          ? { x: 0, y: 32 }
+          : forcedTDir === 'E'
+          ? { x: 32, y: 0 }
+          : { x: -32, y: 0 };
+      const entryHint = { x: port.x + outVec.x, y: port.y + outVec.y };
+      bestFaces = {
+        sDir: selectBestSourceFaceTowardPoint(source, entryHint),
+        tDir: forcedTDir
+      };
+    }
   }
 
   return bestFaces;
@@ -460,7 +484,9 @@ const computeTopologyKey = (
   linksList: TransferLink[],
   corridorsList: RouteCorridor[]
 ): string => {
-  const nodeKey = nodesList.map((n) => `${n.id}:${n.x},${n.y}:${n.outputEdge || ''}`).join('|');
+  const nodeKey = nodesList
+    .map((n) => `${n.id}:${n.x},${n.y}:${n.outputEdge || ''}:${n.inputEdge || ''}`)
+    .join('|');
   const linkKey = linksList
     .map((l) => `${l.id}:${l.sourceId}->${l.targetId}@${getLinkCorridorIds(l).join(',')}`)
     .join('|');
@@ -855,10 +881,10 @@ export const computeAllLinkRoutes = (
       }
 
       const sDir = source.outputEdge ?? selectBestSourceFaceTowardPoint(source, entryHint);
-      const tDir = selectBestTargetFaceFromPoint(exitHint, target);
+      const tDir = target.inputEdge ?? selectBestTargetFaceFromPoint(exitHint, target);
       validLinks.push({ link, source, target, sDir, tDir, corridorChain });
     } else {
-      const { sDir, tDir } = selectBestCardinalFaces(source, target, source.outputEdge);
+      const { sDir, tDir } = selectBestCardinalFaces(source, target, source.outputEdge, target.inputEdge);
       validLinks.push({ link, source, target, sDir, tDir });
     }
   });
@@ -2429,5 +2455,21 @@ export const getEffectiveContainerOutputEdge = (
     if (r) return r.sDir;
   }
   return 'E';
+};
+
+export const getEffectiveContainerInputEdge = (
+  node: ContainerNode,
+  nodesList: ContainerNode[],
+  linksList: TransferLink[],
+  corridorsList: RouteCorridor[] = []
+): CardinalEdge => {
+  if (node.inputEdge) return node.inputEdge;
+  const routes = computeAllLinkRoutes(nodesList, linksList, corridorsList);
+  const firstIncoming = linksList.find((l) => l.targetId === node.id);
+  if (firstIncoming) {
+    const r = routes.get(firstIncoming.id);
+    if (r) return r.tDir;
+  }
+  return 'W';
 };
 

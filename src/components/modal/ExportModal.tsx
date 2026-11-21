@@ -96,7 +96,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       // 2. Container nodes with all properties
       lines.push('# SECTION: INITIAL MODEL NODES');
-      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge');
+      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge,InputEdge');
       const day0Frame = frames[0];
       nodes.forEach(n => {
         const escapedName = `"${(n.name || '').replace(/"/g, '""')}"`;
@@ -109,7 +109,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         const meta = getStatusMeta(day0Status, 0);
         const escapedNotes = `"${(n.notes || '').replace(/"/g, '""')}"`;
         const outputEdge = n.outputEdge || '';
-        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge}`);
+        const inputEdge = n.inputEdge || '';
+        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge},${inputEdge}`);
       });
       lines.push('');
 
@@ -241,7 +242,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         colorKey: {
           blue: { colour: 'Blue', hex: '#38bdf8', meaning: 'Day 0 (frozen) + any time a container cannot deliver due to lack of material' },
           green: { colour: 'Green', hex: '#22c55e', meaning: 'Flowing at full rate' },
-          amber: { colour: 'Amber', hex: '#f59e0b', meaning: 'Flowing at restricted rate (throttleback or partial source material)' },
+          amber: { colour: 'Amber', hex: '#f59e0b', meaning: 'Flowing at restricted rate (downstream capacity throttleback)' },
           red: { colour: 'Red', hex: '#ef4444', meaning: 'Blocked from sending/receiving due to capacity issues or calendar restriction' }
         }
       }
@@ -261,7 +262,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         strictSubRule: n.strictSubRule || 'throttleback',
         headroomThreshold: n.headroomThreshold ?? 500,
         status: n.status || 'active',
-        outputEdge: n.outputEdge || ''
+        outputEdge: n.outputEdge || '',
+        inputEdge: n.inputEdge || ''
       }));
       payload.corridors = corridors.map(c => ({
         id: c.id,

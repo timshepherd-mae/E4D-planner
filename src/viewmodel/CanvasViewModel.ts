@@ -283,6 +283,14 @@ export class CanvasViewModel {
     }
   }
 
+  public setNodeInputEdge(id: string, inputEdge?: CardinalEdge): void {
+    const node = this.nodes.find(n => n.id === id);
+    if (node) {
+      if (inputEdge) node.inputEdge = inputEdge;
+      else delete node.inputEdge;
+    }
+  }
+
   public updateNodes(filterFn: (node: ContainerNode) => boolean, updates: Partial<ContainerNode>): void {
     this.nodes.forEach(node => {
       if (filterFn(node)) {
@@ -325,6 +333,13 @@ export class CanvasViewModel {
     const corridor = this.corridors.find(c => c.id === id);
     if (corridor && corridor.waypoints[index]) {
       corridor.waypoints[index] = { x: pt.x, y: pt.y };
+    }
+  }
+
+  public setCorridorWaypoints(id: string, waypoints: Point[]): void {
+    const corridor = this.corridors.find(c => c.id === id);
+    if (corridor && waypoints.length >= 2) {
+      corridor.waypoints = waypoints.map(pt => ({ x: pt.x, y: pt.y }));
     }
   }
 

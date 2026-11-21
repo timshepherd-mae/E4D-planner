@@ -27,6 +27,7 @@ export class SimEngine {
 
   public runSimulation(): SimFrame[] {
     const frames: SimFrame[] = [];
+    const EPS = 1e-6;
     this.headroomHoldStates.clear();
 
     for (let day = 0; day <= this.totalDays; day++) {
@@ -81,7 +82,7 @@ export class SimEngine {
           return;
         }
 
-        if (source.currentVolume <= 0) {
+        if (source.currentVolume <= EPS) {
           outboundLinks.forEach(l => requestedTransfers.set(l.id, 0));
           if (day > 0 && !alerts.includes(`Day ${day}: Stockout at source ${source.name}.`)) {
             alerts.push(`Day ${day}: Stockout at source ${source.name}.`);
@@ -216,7 +217,8 @@ export class SimEngine {
             const bulkIn = mat ? mat.bulkIN : 1.0;
 
             const volumeRemoved = transferAmount * bulkOut;
-            source.currentVolume = Math.max(0, source.currentVolume - volumeRemoved);
+            const remainingSource = source.currentVolume - volumeRemoved;
+            source.currentVolume = remainingSource < EPS ? 0 : remainingSource;
 
             const volumeAdded = transferAmount * bulkIn;
             const targetOverflowMode = target.overflowMode || this.defaultOverflowMode;
@@ -243,10 +245,10 @@ export class SimEngine {
       });
 
       // Step 4: Classify Link and Node visual flow statuses according to exact color key:
-      // Blue: Day 0 (frozen) + any time a container cannot deliver due to lack of material
+      // Blue: Day 0 (frozen) + empty containers + any time a container/transfer cannot deliver full rate due to lack of material
       // Green: flowing at full rate
-      // Amber: flowing at restricted rate (throttleback, partial source material < daily rate, or calendar restriction)
-      // Red: blocked from sending/receiving due to capacity issues or calendar restriction
+      // Amber: flowing at restricted rate (downstream capacity throttleback)
+      // Red: blocked from sending/receiving due to capacity issues or maintenance
       const linkStatuses: Record<string, FlowStatus> = {};
       const nodeStatuses: Record<string, FlowStatus> = {};
 
@@ -260,22 +262,26 @@ export class SimEngine {
           const target = this.nodes.get(link.targetId);
           const linkRate = activeLinkRates.get(link.id) ?? link.dailyRate;
           const actualFlow = linkFlows[link.id] ?? 0;
+          const requestedFlow = requestedTransfers.get(link.id) ?? 0;
           const startVol = startOfDayVolumes[link.sourceId] ?? 0;
 
-          if (!source || !target) {
+          if (!source || !target || linkRate <= EPS) {
             linkStatuses[link.id] = 'frozen';
-          } else if (startVol <= 0) {
-            // Container cannot deliver due to lack of material (blue)
+          } else if (startVol <= EPS) {
+            // Source was already empty at start of day (blue)
             linkStatuses[link.id] = 'starved';
-          } else if (actualFlow === 0) {
+          } else if (actualFlow <= EPS) {
             // Blocked from sending/receiving due to capacity issues, headroom hold, or maintenance (red)
             linkStatuses[link.id] = 'blocked';
-          } else if (actualFlow < linkRate) {
-            // Flowing at restricted rate (amber)
-            linkStatuses[link.id] = 'restricted';
-          } else {
+          } else if (actualFlow >= linkRate - EPS) {
             // Flowing at full rate (green)
             linkStatuses[link.id] = 'full';
+          } else if (actualFlow < requestedFlow - EPS && source.currentVolume > EPS) {
+            // Flowing at restricted rate due to downstream capacity throttling (amber)
+            linkStatuses[link.id] = 'restricted';
+          } else {
+            // Source lacked material / ran empty before meeting daily rate (blue)
+            linkStatuses[link.id] = 'starved';
           }
         });
 
@@ -293,22 +299,25 @@ export class SimEngine {
           const nodeOverflow = node.overflowMode || this.defaultOverflowMode;
           const isHalted = this.headroomHoldStates.get(node.id) || false;
           const isAtCapacity = nodeOverflow !== 'overfill' && node.currentVolume >= node.capacity;
+          const isEmpty = node.currentVolume <= EPS;
 
           const hasBlocked = connected.some(l => linkStatuses[l.id] === 'blocked');
           const hasRestricted = connected.some(l => linkStatuses[l.id] === 'restricted');
           const hasFull = connected.some(l => linkStatuses[l.id] === 'full');
-          const isStarvedSource = outbound.length > 0 && node.currentVolume <= 0;
 
-          if (isAtCapacity || isHalted || node.status === 'blocked' || hasBlocked) {
-            // Blocked from sending/receiving due to capacity issues (red)
+          if (isAtCapacity || isHalted || node.status === 'blocked' || node.status === 'maintenance' || (!isEmpty && hasBlocked)) {
+            // Blocked from sending/receiving due to capacity issues or maintenance (red)
             nodeStatuses[node.id] = 'blocked';
+          } else if (isEmpty) {
+            // Empty container turns blue (starved if it has outbound demand, frozen/idle otherwise)
+            nodeStatuses[node.id] = outbound.length > 0 ? 'starved' : 'frozen';
           } else if (hasRestricted) {
             // Flowing at restricted rate (amber)
             nodeStatuses[node.id] = 'restricted';
           } else if (hasFull) {
             // Flowing at full rate (green)
             nodeStatuses[node.id] = 'full';
-          } else if (isStarvedSource) {
+          } else if (outbound.length > 0) {
             // Cannot deliver due to lack of material (blue)
             nodeStatuses[node.id] = 'starved';
           } else {

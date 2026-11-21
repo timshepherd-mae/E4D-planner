@@ -27,6 +27,7 @@ export interface ContainerNode {
   status?: NodeStatus;
   allowedMaterials?: string[];
   outputEdge?: CardinalEdge;
+  inputEdge?: CardinalEdge;
   notes?: string;
 }
 
@@ -101,6 +102,7 @@ export interface ContainerProperties {
   status?: NodeStatus;
   allowedMaterials?: string[];
   outputEdge?: CardinalEdge;
+  inputEdge?: CardinalEdge;
   notes?: string;
 }
 

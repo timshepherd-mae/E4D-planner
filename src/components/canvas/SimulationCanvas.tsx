@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { ContainerNode, TransferLink, RouteCorridor, SimFrame, FlowStatus, GRAPH_LINE_COLORS, getLinkCorridorIds } from '../../models/types';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
-import { initPipeRouter, isPipeRouterReady, computeAllLinkRoutes, getEffectiveContainerOutputEdge } from './pipeRouter';
+import { initPipeRouter, isPipeRouterReady, computeAllLinkRoutes, getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge } from './pipeRouter';
 
 interface Point { x: number; y: number; }
 
@@ -113,7 +113,10 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 }); // In world coordinates
   const nodeInitialPositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
 
-  // Route Corridor Vertex/Bend Handle Dragging State
+  // Route Corridor Dragging (whole route) & Vertex/Bend Handle Dragging State
+  const [isDraggingCorridor, setIsDraggingCorridor] = useState<boolean>(false);
+  const corridorInitialWaypointsRef = useRef<Map<string, Point[]>>(new Map());
+  const corridorLastDeltaRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDraggingCorridorHandle, setIsDraggingCorridorHandle] = useState<boolean>(false);
   const draggedCorridorHandleRef = useRef<{ corridorId: string; waypointIndex: number } | null>(null);
 
@@ -351,9 +354,9 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
     };
   }, []);
 
-  // 3. Global Window Listeners for Active Panning, Node Dragging, and Corridor Handle Dragging
+  // 3. Global Window Listeners for Active Panning, Node Dragging, Whole-Corridor Dragging, and Corridor Handle Dragging
   useEffect(() => {
-    if (!isPanning && !isDragging && !isDraggingCorridorHandle) return;
+    if (!isPanning && !isDragging && !isDraggingCorridor && !isDraggingCorridorHandle) return;
 
     const handleWindowMouseMove = (e: MouseEvent) => {
       if (isPanning) {
@@ -382,6 +385,43 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         const { corridorId, waypointIndex } = draggedCorridorHandleRef.current;
         vm.updateCorridorWaypoint(corridorId, waypointIndex, { x: snappedX, y: snappedY });
         onCorridorsUpdated();
+      } else if (isDraggingCorridor) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        const currentZ = zoomRef.current;
+        const currentP = panRef.current;
+        const worldX = (mouseX - currentP.x) / currentZ;
+        const worldY = (mouseY - currentP.y) / currentZ;
+
+        const dWorldX = worldX - dragStartRef.current.x;
+        const dWorldY = worldY - dragStartRef.current.y;
+
+        const snap = getAdaptiveGrid(currentZ).snap;
+        const finalDeltaX = Math.round(dWorldX / snap) * snap;
+        const finalDeltaY = Math.round(dWorldY / snap) * snap;
+
+        if (
+          finalDeltaX !== corridorLastDeltaRef.current.x ||
+          finalDeltaY !== corridorLastDeltaRef.current.y
+        ) {
+          corridorLastDeltaRef.current = { x: finalDeltaX, y: finalDeltaY };
+          corridors.forEach(c => {
+            if (selectedCorridorIds.includes(c.id)) {
+              const initial = corridorInitialWaypointsRef.current.get(c.id);
+              if (initial) {
+                vm.setCorridorWaypoints(
+                  c.id,
+                  initial.map(pt => ({ x: pt.x + finalDeltaX, y: pt.y + finalDeltaY }))
+                );
+              }
+            }
+          });
+          onCorridorsUpdated();
+        }
       } else if (isDragging) {
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -522,6 +562,9 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
       if (isDragging && e.button === 0) {
         setIsDragging(false);
       }
+      if (isDraggingCorridor && e.button === 0) {
+        setIsDraggingCorridor(false);
+      }
       if (isDraggingCorridorHandle && e.button === 0) {
         setIsDraggingCorridorHandle(false);
         draggedCorridorHandleRef.current = null;
@@ -534,7 +577,7 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
       window.removeEventListener('mousemove', handleWindowMouseMove);
       window.removeEventListener('mouseup', handleWindowMouseUp);
     };
-  }, [isPanning, isDragging, isDraggingCorridorHandle, selectedNodeIds, nodes, onNodesUpdated, onCorridorsUpdated, vm]);
+  }, [isPanning, isDragging, isDraggingCorridor, isDraggingCorridorHandle, selectedNodeIds, selectedCorridorIds, nodes, corridors, onNodesUpdated, onCorridorsUpdated, vm]);
 
   // 4. Main Canvas Render Pipeline with Proportional Viewport Transform & Dynamic Grid
   useEffect(() => {
@@ -864,21 +907,43 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         }
         ctx.restore();
 
-        // Draw output socket edge indicator when container is selected (Edit Mode)
+        // Draw output and input socket edge indicators when container is selected (Edit Mode)
         if (isSelected && !isPlayback) {
           const activeOutEdge = getEffectiveContainerOutputEdge(node, nodes, links, corridors);
-          const socketCenter =
-            activeOutEdge === 'N'
-              ? { x: node.x + width / 2, y: node.y, angle: -Math.PI / 2 }
-              : activeOutEdge === 'S'
-              ? { x: node.x + width / 2, y: node.y + height, angle: Math.PI / 2 }
-              : activeOutEdge === 'W'
-              ? { x: node.x, y: node.y + height / 2, angle: Math.PI }
-              : { x: node.x + width, y: node.y + height / 2, angle: 0 };
+          const activeInEdge = getEffectiveContainerInputEdge(node, nodes, links, corridors);
+          const sameEdge = activeOutEdge === activeInEdge;
 
+          const getEdgePose = (edge: 'N' | 'E' | 'S' | 'W', alongOffset: number) =>
+            edge === 'N'
+              ? { x: node.x + width / 2 + alongOffset, y: node.y, angle: -Math.PI / 2 }
+              : edge === 'S'
+              ? { x: node.x + width / 2 + alongOffset, y: node.y + height, angle: Math.PI / 2 }
+              : edge === 'W'
+              ? { x: node.x, y: node.y + height / 2 + alongOffset, angle: Math.PI }
+              : { x: node.x + width, y: node.y + height / 2 + alongOffset, angle: 0 };
+
+          // Input socket indicator (points inward into container)
+          const inPose = getEdgePose(activeInEdge, sameEdge ? -10 : 0);
           ctx.save();
-          ctx.translate(socketCenter.x, socketCenter.y);
-          ctx.rotate(socketCenter.angle);
+          ctx.translate(inPose.x, inPose.y);
+          ctx.rotate(inPose.angle + Math.PI);
+          ctx.fillStyle = '#22c55e';
+          ctx.strokeStyle = '#0f172a';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(-7, -6);
+          ctx.lineTo(2, 0);
+          ctx.lineTo(-7, 6);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+
+          // Output socket indicator (points outward from container)
+          const outPose = getEdgePose(activeOutEdge, sameEdge ? 10 : 0);
+          ctx.save();
+          ctx.translate(outPose.x, outPose.y);
+          ctx.rotate(outPose.angle);
           ctx.fillStyle = '#38bdf8';
           ctx.strokeStyle = '#0f172a';
           ctx.lineWidth = 1.5;
@@ -1101,33 +1166,107 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
       return false;
     });
 
-    if (labelClickedCorridor) {
+    const selectAndStartCorridorDrag = (targetCorridor: RouteCorridor) => {
+      let newSelectedCorridorIds = [...selectedCorridorIds];
+
       if (isCtrl) {
-        const nextCorridors = selectedCorridorIds.includes(labelClickedCorridor.id)
-          ? selectedCorridorIds.filter(id => id !== labelClickedCorridor.id)
-          : [...selectedCorridorIds, labelClickedCorridor.id];
-        setSelectedCorridorIds(nextCorridors);
+        if (newSelectedCorridorIds.includes(targetCorridor.id)) {
+          newSelectedCorridorIds = newSelectedCorridorIds.filter(id => id !== targetCorridor.id);
+        } else {
+          newSelectedCorridorIds.push(targetCorridor.id);
+        }
+        setSelectedCorridorIds(newSelectedCorridorIds);
       } else {
-        setSelectedCorridorIds([labelClickedCorridor.id]);
-        setSelectedNodeIds([]);
-        setSelectedLinkIds([]);
+        if (!newSelectedCorridorIds.includes(targetCorridor.id) || selectedNodeIds.length > 0 || selectedLinkIds.length > 0) {
+          newSelectedCorridorIds = [targetCorridor.id];
+          setSelectedCorridorIds(newSelectedCorridorIds);
+          setSelectedNodeIds([]);
+          setSelectedLinkIds([]);
+        }
       }
+
+      if (newSelectedCorridorIds.includes(targetCorridor.id)) {
+        setIsDraggingCorridor(true);
+        dragStartRef.current = { x: worldMouse.x, y: worldMouse.y };
+        corridorLastDeltaRef.current = { x: 0, y: 0 };
+        const initialMap = new Map<string, Point[]>();
+        corridors.forEach(c => initialMap.set(c.id, c.waypoints.map(p => ({ x: p.x, y: p.y }))));
+        corridorInitialWaypointsRef.current = initialMap;
+      }
+    };
+
+    const isPointOnCorridorBand = (corridor: RouteCorridor, pt: Point): boolean => {
+      const wps = corridor.waypoints;
+      if (!wps || wps.length < 2) return false;
+      const assignedCount = assignedCorridorCounts.get(corridor.id) || 0;
+      const bandWidth = getCorridorBandWidth(corridor, assignedCount);
+      const bandTolerance = Math.max(bandWidth / 2 + 4, 12 / zoomRef.current);
+
+      for (let i = 0; i < wps.length - 1; i++) {
+        if (distToSegment(pt, wps[i], wps[i + 1]) <= bandTolerance) return true;
+      }
+      return false;
+    };
+
+    if (labelClickedCorridor) {
+      selectAndStartCorridorDrag(labelClickedCorridor);
       return;
     }
 
     // 2. Hit-test links & rate badges
     const hitTolerance = Math.max(4, 6 / zoomRef.current);
     const computedRoutes = computeAllLinkRoutes(nodes, links, corridors);
-    const clickedLink = links.slice().reverse().find(link => {
+
+    const selectClickedLink = (targetLink: TransferLink) => {
+      if (isCtrl) {
+        const nextLinks = selectedLinkIds.includes(targetLink.id)
+          ? selectedLinkIds.filter(id => id !== targetLink.id)
+          : [...selectedLinkIds, targetLink.id];
+        setSelectedLinkIds(nextLinks);
+      } else {
+        setSelectedLinkIds([targetLink.id]);
+        setSelectedNodeIds([]);
+        setSelectedCorridorIds([]);
+      }
+    };
+
+    // 2a. Offline transfer rate badges always stay selectable
+    const clickedLinkBadge = links.slice().reverse().find(link => {
       const route = computedRoutes.get(link.id);
       if (!route || route.points.length < 2) return false;
-
       const badgePt = route.badgePt;
       const badgeW = 50;
       const badgeH = 20;
-      if (worldMouse.x >= badgePt.x - badgeW / 2 && worldMouse.x <= badgePt.x + badgeW / 2 && worldMouse.y >= badgePt.y - badgeH / 2 && worldMouse.y <= badgePt.y + badgeH / 2) {
-        return true;
+      return (
+        worldMouse.x >= badgePt.x - badgeW / 2 &&
+        worldMouse.x <= badgePt.x + badgeW / 2 &&
+        worldMouse.y >= badgePt.y - badgeH / 2 &&
+        worldMouse.y <= badgePt.y + badgeH / 2
+      );
+    });
+
+    if (clickedLinkBadge) {
+      selectClickedLink(clickedLinkBadge);
+      return;
+    }
+
+    // 2b. If a corridor is already selected (and not Ctrl-selecting), allow dragging its band even over bundled lanes
+    if (!isCtrl && selectedCorridorIds.length > 0) {
+      const selectedBandCorridor = corridors
+        .slice()
+        .reverse()
+        .find((corridor) => selectedCorridorIds.includes(corridor.id) && isPointOnCorridorBand(corridor, worldMouse));
+
+      if (selectedBandCorridor) {
+        selectAndStartCorridorDrag(selectedBandCorridor);
+        return;
       }
+    }
+
+    // 2c. Hit-test transfer link segments
+    const clickedLink = links.slice().reverse().find(link => {
+      const route = computedRoutes.get(link.id);
+      if (!route || route.points.length < 2) return false;
 
       for (let i = 0; i < route.points.length - 1; i++) {
         if (distToSegment(worldMouse, route.points[i], route.points[i + 1]) < hitTolerance) return true;
@@ -1136,44 +1275,15 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
     });
 
     if (clickedLink) {
-      if (isCtrl) {
-        const nextLinks = selectedLinkIds.includes(clickedLink.id)
-          ? selectedLinkIds.filter(id => id !== clickedLink.id)
-          : [...selectedLinkIds, clickedLink.id];
-        setSelectedLinkIds(nextLinks);
-      } else {
-        setSelectedLinkIds([clickedLink.id]);
-        setSelectedNodeIds([]);
-        setSelectedCorridorIds([]);
-      }
+      selectClickedLink(clickedLink);
       return;
     }
 
     // 3. Hit-test route corridor halo bands
-    const clickedCorridor = corridors.slice().reverse().find((corridor) => {
-      const wps = corridor.waypoints;
-      if (!wps || wps.length < 2) return false;
-      const assignedCount = assignedCorridorCounts.get(corridor.id) || 0;
-      const bandWidth = getCorridorBandWidth(corridor, assignedCount);
-      const bandTolerance = Math.max(bandWidth / 2 + 4, 12 / zoomRef.current);
-
-      for (let i = 0; i < wps.length - 1; i++) {
-        if (distToSegment(worldMouse, wps[i], wps[i + 1]) <= bandTolerance) return true;
-      }
-      return false;
-    });
+    const clickedCorridor = corridors.slice().reverse().find((corridor) => isPointOnCorridorBand(corridor, worldMouse));
 
     if (clickedCorridor) {
-      if (isCtrl) {
-        const nextCorridors = selectedCorridorIds.includes(clickedCorridor.id)
-          ? selectedCorridorIds.filter(id => id !== clickedCorridor.id)
-          : [...selectedCorridorIds, clickedCorridor.id];
-        setSelectedCorridorIds(nextCorridors);
-      } else {
-        setSelectedCorridorIds([clickedCorridor.id]);
-        setSelectedNodeIds([]);
-        setSelectedLinkIds([]);
-      }
+      selectAndStartCorridorDrag(clickedCorridor);
       return;
     }
 
@@ -1238,7 +1348,7 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
   const getCanvasCursor = () => {
     if (isPanning) return 'grabbing';
     if (isSpacePressed) return 'grab';
-    if (isDragging || isDraggingCorridorHandle) return 'grabbing';
+    if (isDragging || isDraggingCorridor || isDraggingCorridorHandle) return 'grabbing';
     return isPlayback ? 'default' : 'default';
   };
 

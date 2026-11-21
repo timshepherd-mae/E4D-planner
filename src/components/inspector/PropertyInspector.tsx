@@ -491,11 +491,29 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Output Socket Edge</label>
-                  <span style={{ fontSize: '10px', color: '#64748b' }}>Press E to cycle</span>
+                  <span style={{ fontSize: '10px', color: '#64748b' }}>Press O to cycle</span>
                 </div>
                 <select
                   value={singleSelectedNode.outputEdge || ''}
                   onChange={e => onUpdateSingleNode('outputEdge', e.target.value || undefined)}
+                  style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
+                >
+                  <option value="">Auto (Shortest Path)</option>
+                  <option value="N">North (Top Edge)</option>
+                  <option value="E">East (Right Edge)</option>
+                  <option value="S">South (Bottom Edge)</option>
+                  <option value="W">West (Left Edge)</option>
+                </select>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Input Socket Edge</label>
+                  <span style={{ fontSize: '10px', color: '#64748b' }}>Press I to cycle</span>
+                </div>
+                <select
+                  value={singleSelectedNode.inputEdge || ''}
+                  onChange={e => onUpdateSingleNode('inputEdge', e.target.value || undefined)}
                   style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
                 >
                   <option value="">Auto (Shortest Path)</option>
@@ -697,7 +715,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                 <div style={{ color: '#cbd5e1', fontWeight: 600, marginBottom: '2px', fontVariantNumeric: 'tabular-nums' }}>
                   Geometry ({selectedCorridor.waypoints.length} waypoints)
                 </div>
-                Drag endpoints or bend handles on canvas. Drag segment midpoints (+) to add bends; double-click a bend to remove it.
+                Drag the route band or label to move the whole route. Drag endpoints or bend handles to reshape; drag segment midpoints (+) to add bends or double-click a bend to remove it.
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
