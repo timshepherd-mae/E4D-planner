@@ -2473,3 +2473,395 @@ export const getEffectiveContainerInputEdge = (
   return 'W';
 };
 
+export const computeBestFitCorridorWaypoints = (
+  nodesList: ContainerNode[],
+  linksList: TransferLink[],
+  selectedLinkIds: string[],
+  corridorsList: RouteCorridor[] = [],
+  snap = 20
+): [Point, Point] | null => {
+  const nodeMap = new Map<string, ContainerNode>();
+  nodesList.forEach((n) => nodeMap.set(n.id, n));
+
+  const selectedSet = new Set(selectedLinkIds);
+  const targetLinks = linksList.filter(
+    (l) => selectedSet.has(l.id) && nodeMap.has(l.sourceId) && nodeMap.has(l.targetId)
+  );
+  if (targetLinks.length === 0) return null;
+
+  const computedRoutes = computeAllLinkRoutes(nodesList, linksList, corridorsList);
+  const snapVal = (v: number) => Math.round(v / snap) * snap;
+
+  interface LinkGeom {
+    source: ContainerNode;
+    target: ContainerNode;
+    pStart: Point;
+    pEnd: Point;
+    sDir: CardinalDirection;
+    tDir: CardinalDirection;
+    dx: number;
+    dy: number;
+    leftNodeRight: number;
+    rightNodeLeft: number;
+    topNodeBottom: number;
+    bottomNodeTop: number;
+  }
+
+  const linkGeoms: LinkGeom[] = [];
+  let sumAbsDx = 0;
+  let sumAbsDy = 0;
+  let sumSignedDx = 0;
+  let sumSignedDy = 0;
+  let sumMidX = 0;
+  let sumMidY = 0;
+  let minPortX = Infinity;
+  let maxPortX = -Infinity;
+  let minPortY = Infinity;
+  let maxPortY = -Infinity;
+
+  let weightedHorizYNum = 0;
+  let weightedHorizLen = 0;
+  let weightedVertXNum = 0;
+  let weightedVertLen = 0;
+
+  targetLinks.forEach((link) => {
+    const source = nodeMap.get(link.sourceId)!;
+    const target = nodeMap.get(link.targetId)!;
+    const route = computedRoutes.get(link.id);
+
+    const pStart = route?.startPort ?? { x: source.x + CARD_W / 2, y: source.y + CARD_H / 2 };
+    const pEnd = route?.endPort ?? { x: target.x + CARD_W / 2, y: target.y + CARD_H / 2 };
+    const sDir: CardinalDirection =
+      route?.sDir ?? (Math.abs(pEnd.x - pStart.x) >= Math.abs(pEnd.y - pStart.y) ? (pEnd.x >= pStart.x ? 'E' : 'W') : (pEnd.y >= pStart.y ? 'S' : 'N'));
+    const tDir: CardinalDirection =
+      route?.tDir ?? (sDir === 'N' ? 'S' : sDir === 'S' ? 'N' : sDir === 'E' ? 'W' : 'E');
+
+    const dx = pEnd.x - pStart.x;
+    const dy = pEnd.y - pStart.y;
+    sumAbsDx += Math.abs(dx);
+    sumAbsDy += Math.abs(dy);
+    sumSignedDx += dx;
+    sumSignedDy += dy;
+    sumMidX += (pStart.x + pEnd.x) / 2;
+    sumMidY += (pStart.y + pEnd.y) / 2;
+
+    minPortX = Math.min(minPortX, pStart.x, pEnd.x);
+    maxPortX = Math.max(maxPortX, pStart.x, pEnd.x);
+    minPortY = Math.min(minPortY, pStart.y, pEnd.y);
+    maxPortY = Math.max(maxPortY, pStart.y, pEnd.y);
+
+    if (route && route.points.length >= 2) {
+      for (let i = 0; i < route.points.length - 1; i++) {
+        const a = route.points[i];
+        const b = route.points[i + 1];
+        const segDx = Math.abs(b.x - a.x);
+        const segDy = Math.abs(b.y - a.y);
+        if (segDx > 4 && segDy < 1) {
+          weightedHorizYNum += ((a.y + b.y) / 2) * segDx;
+          weightedHorizLen += segDx;
+        } else if (segDy > 4 && segDx < 1) {
+          weightedVertXNum += ((a.x + b.x) / 2) * segDy;
+          weightedVertLen += segDy;
+        }
+      }
+    }
+
+    linkGeoms.push({
+      source,
+      target,
+      pStart,
+      pEnd,
+      sDir,
+      tDir,
+      dx,
+      dy,
+      leftNodeRight: Math.min(source.x + CARD_W, target.x + CARD_W),
+      rightNodeLeft: Math.max(source.x, target.x),
+      topNodeBottom: Math.min(source.y + CARD_H, target.y + CARD_H),
+      bottomNodeTop: Math.max(source.y, target.y)
+    });
+  });
+
+  const avgMidX = sumMidX / linkGeoms.length;
+  const avgMidY = sumMidY / linkGeoms.length;
+
+  const bandWidth = Math.max(28, Math.max(0, linkGeoms.length - 1) * 5 + 24);
+  const bandHalf = bandWidth / 2;
+  const NODE_CLEAR_PERP = bandHalf + 12;
+  const NODE_CLEAR_ALONG = 14;
+  const LEAD_INSET = MIN_SOCKET_LEAD + 20;
+  const MIN_CORRIDOR_LEN = 80;
+
+  const rectsOverlapAxis = (
+    ax1: number,
+    ay1: number,
+    ax2: number,
+    ay2: number,
+    bx1: number,
+    by1: number,
+    bx2: number,
+    by2: number
+  ): boolean => ax1 < bx2 && ax2 > bx1 && ay1 < by2 && ay2 > by1;
+
+  const countNodeOverlaps = (x1: number, y1: number, x2: number, y2: number, isHoriz: boolean): number => {
+    const rx1 = Math.min(x1, x2) - (isHoriz ? NODE_CLEAR_ALONG : NODE_CLEAR_PERP);
+    const rx2 = Math.max(x1, x2) + (isHoriz ? NODE_CLEAR_ALONG : NODE_CLEAR_PERP);
+    const ry1 = Math.min(y1, y2) - (isHoriz ? NODE_CLEAR_PERP : NODE_CLEAR_ALONG);
+    const ry2 = Math.max(y1, y2) + (isHoriz ? NODE_CLEAR_PERP : NODE_CLEAR_ALONG);
+    let hits = 0;
+    for (const node of nodesList) {
+      if (rectsOverlapAxis(rx1, ry1, rx2, ry2, node.x, node.y, node.x + CARD_W, node.y + CARD_H)) {
+        hits++;
+      }
+    }
+    return hits;
+  };
+
+  const countExistingCorridorOverlaps = (x1: number, y1: number, x2: number, y2: number, isHoriz: boolean): number => {
+    const rx1 = Math.min(x1, x2) - (isHoriz ? 8 : bandHalf + 14);
+    const rx2 = Math.max(x1, x2) + (isHoriz ? 8 : bandHalf + 14);
+    const ry1 = Math.min(y1, y2) - (isHoriz ? bandHalf + 14 : 8);
+    const ry2 = Math.max(y1, y2) + (isHoriz ? bandHalf + 14 : 8);
+    let hits = 0;
+    for (const c of corridorsList) {
+      const wps = c.waypoints;
+      for (let i = 0; i < wps.length - 1; i++) {
+        const sx1 = Math.min(wps[i].x, wps[i + 1].x);
+        const sx2 = Math.max(wps[i].x, wps[i + 1].x);
+        const sy1 = Math.min(wps[i].y, wps[i + 1].y);
+        const sy2 = Math.max(wps[i].y, wps[i + 1].y);
+        if (rectsOverlapAxis(rx1, ry1, rx2, ry2, sx1, sy1, sx2, sy2)) {
+          hits++;
+          break;
+        }
+      }
+    }
+    return hits;
+  };
+
+  interface CorridorCandidate {
+    orientation: 'H' | 'V';
+    waypoints: [Point, Point];
+    nodeHits: number;
+    hasCleanGap: boolean;
+    score: number;
+  }
+
+  const evaluateCandidate = (
+    orientation: 'H' | 'V',
+    pA: Point,
+    pB: Point,
+    nodeHits: number,
+    corridorHits: number,
+    hasCleanGap: boolean,
+    axisShift: number
+  ): CorridorCandidate => {
+    const corridorLen = Math.hypot(pB.x - pA.x, pB.y - pA.y);
+    let totalDetour = 0;
+    let backwardPenalty = 0;
+
+    for (const g of linkGeoms) {
+      const directDist = Math.abs(g.pEnd.x - g.pStart.x) + Math.abs(g.pEnd.y - g.pStart.y);
+      const fwdDist =
+        Math.abs(pA.x - g.pStart.x) +
+        Math.abs(pA.y - g.pStart.y) +
+        corridorLen +
+        Math.abs(g.pEnd.x - pB.x) +
+        Math.abs(g.pEnd.y - pB.y);
+      const revDist =
+        Math.abs(pB.x - g.pStart.x) +
+        Math.abs(pB.y - g.pStart.y) +
+        corridorLen +
+        Math.abs(g.pEnd.x - pA.x) +
+        Math.abs(g.pEnd.y - pA.y);
+      const useRev = revDist < fwdDist;
+      const entryPt = useRev ? pB : pA;
+      const exitPt = useRev ? pA : pB;
+      const viaDist = Math.min(fwdDist, revDist);
+      totalDetour += Math.max(0, viaDist - directDist);
+
+      const sBack =
+        (g.sDir === 'E' && entryPt.x < g.pStart.x - 2) ||
+        (g.sDir === 'W' && entryPt.x > g.pStart.x + 2) ||
+        (g.sDir === 'S' && entryPt.y < g.pStart.y - 2) ||
+        (g.sDir === 'N' && entryPt.y > g.pStart.y + 2);
+      const tBack =
+        (g.tDir === 'W' && exitPt.x > g.pEnd.x + 2) ||
+        (g.tDir === 'E' && exitPt.x < g.pEnd.x - 2) ||
+        (g.tDir === 'N' && exitPt.y > g.pEnd.y + 2) ||
+        (g.tDir === 'S' && exitPt.y < g.pEnd.y - 2);
+      if (sBack) backwardPenalty += 80;
+      if (tBack) backwardPenalty += 80;
+    }
+
+    const dominantBonus =
+      orientation === 'H'
+        ? sumAbsDx >= sumAbsDy
+          ? -35
+          : 0
+        : sumAbsDy > sumAbsDx
+        ? -35
+        : 0;
+
+    const score =
+      nodeHits * 100000 +
+      totalDetour / linkGeoms.length +
+      backwardPenalty / linkGeoms.length +
+      corridorHits * 60 +
+      axisShift * 0.35 +
+      (hasCleanGap ? -45 : 0) +
+      dominantBonus;
+
+    return {
+      orientation,
+      waypoints: [pA, pB],
+      nodeHits,
+      hasCleanGap,
+      score
+    };
+  };
+
+  // --- Candidate 1: Strictly Horizontal Corridor ---
+  const buildHorizontalCandidate = (): CorridorCandidate => {
+    const separated = linkGeoms.filter((g) => g.rightNodeLeft > g.leftNodeRight);
+    let rawX1: number;
+    let rawX2: number;
+    let hasCleanGap = false;
+
+    if (separated.length > 0) {
+      const innerLeft = Math.max(...separated.map((g) => g.leftNodeRight));
+      const innerRight = Math.min(...separated.map((g) => g.rightNodeLeft));
+      const gapW = innerRight - innerLeft;
+
+      if (gapW >= 40) {
+        hasCleanGap = true;
+        const inset = Math.min(LEAD_INSET, Math.max(0, (gapW - MIN_CORRIDOR_LEN) / 2));
+        rawX1 = innerLeft + inset;
+        rawX2 = innerRight - inset;
+      } else {
+        const spanLen = Math.min(260, Math.max(MIN_CORRIDOR_LEN, (maxPortX - minPortX) * 0.5));
+        rawX1 = avgMidX - spanLen / 2;
+        rawX2 = avgMidX + spanLen / 2;
+      }
+    } else {
+      const spanLen = Math.min(260, Math.max(MIN_CORRIDOR_LEN, (maxPortX - minPortX) * 0.5));
+      rawX1 = avgMidX - spanLen / 2;
+      rawX2 = avgMidX + spanLen / 2;
+    }
+
+    let xStart = snapVal(rawX1);
+    let xEnd = snapVal(rawX2);
+    if (xEnd - xStart < MIN_CORRIDOR_LEN) {
+      const cx = snapVal((rawX1 + rawX2) / 2);
+      xStart = cx - MIN_CORRIDOR_LEN / 2;
+      xEnd = cx + MIN_CORRIDOR_LEN / 2;
+    }
+
+    const yIdeal = weightedHorizLen > 0 ? weightedHorizYNum / weightedHorizLen : avgMidY;
+    const yBase = snapVal(yIdeal);
+
+    let bestY = yBase;
+    let bestYNodeHits = Infinity;
+    let bestYCorridorHits = Infinity;
+    let bestYCost = Infinity;
+
+    for (let step = 0; step <= 30; step++) {
+      const offsets = step === 0 ? [0] : [step * snap, -step * snap];
+      for (const off of offsets) {
+        const candY = yBase + off;
+        const nHits = countNodeOverlaps(xStart, candY, xEnd, candY, true);
+        const cHits = countExistingCorridorOverlaps(xStart, candY, xEnd, candY, true);
+        const cost = nHits * 100000 + cHits * 120 + Math.abs(candY - yIdeal);
+        if (cost < bestYCost) {
+          bestYCost = cost;
+          bestY = candY;
+          bestYNodeHits = nHits;
+          bestYCorridorHits = cHits;
+        }
+      }
+      if (bestYNodeHits === 0 && bestYCorridorHits === 0 && step * snap > Math.abs(bestY - yIdeal) + snap) {
+        break;
+      }
+    }
+
+    const pA: Point = sumSignedDx >= 0 ? { x: xStart, y: bestY } : { x: xEnd, y: bestY };
+    const pB: Point = sumSignedDx >= 0 ? { x: xEnd, y: bestY } : { x: xStart, y: bestY };
+
+    return evaluateCandidate('H', pA, pB, bestYNodeHits, bestYCorridorHits, hasCleanGap, Math.abs(bestY - yIdeal));
+  };
+
+  // --- Candidate 2: Strictly Vertical Corridor ---
+  const buildVerticalCandidate = (): CorridorCandidate => {
+    const separated = linkGeoms.filter((g) => g.bottomNodeTop > g.topNodeBottom);
+    let rawY1: number;
+    let rawY2: number;
+    let hasCleanGap = false;
+
+    if (separated.length > 0) {
+      const innerTop = Math.max(...separated.map((g) => g.topNodeBottom));
+      const innerBottom = Math.min(...separated.map((g) => g.bottomNodeTop));
+      const gapH = innerBottom - innerTop;
+
+      if (gapH >= 40) {
+        hasCleanGap = true;
+        const inset = Math.min(LEAD_INSET, Math.max(0, (gapH - MIN_CORRIDOR_LEN) / 2));
+        rawY1 = innerTop + inset;
+        rawY2 = innerBottom - inset;
+      } else {
+        const spanLen = Math.min(260, Math.max(MIN_CORRIDOR_LEN, (maxPortY - minPortY) * 0.5));
+        rawY1 = avgMidY - spanLen / 2;
+        rawY2 = avgMidY + spanLen / 2;
+      }
+    } else {
+      const spanLen = Math.min(260, Math.max(MIN_CORRIDOR_LEN, (maxPortY - minPortY) * 0.5));
+      rawY1 = avgMidY - spanLen / 2;
+      rawY2 = avgMidY + spanLen / 2;
+    }
+
+    let yStart = snapVal(rawY1);
+    let yEnd = snapVal(rawY2);
+    if (yEnd - yStart < MIN_CORRIDOR_LEN) {
+      const cy = snapVal((rawY1 + rawY2) / 2);
+      yStart = cy - MIN_CORRIDOR_LEN / 2;
+      yEnd = cy + MIN_CORRIDOR_LEN / 2;
+    }
+
+    const xIdeal = weightedVertLen > 0 ? weightedVertXNum / weightedVertLen : avgMidX;
+    const xBase = snapVal(xIdeal);
+
+    let bestX = xBase;
+    let bestXNodeHits = Infinity;
+    let bestXCorridorHits = Infinity;
+    let bestXCost = Infinity;
+
+    for (let step = 0; step <= 30; step++) {
+      const offsets = step === 0 ? [0] : [step * snap, -step * snap];
+      for (const off of offsets) {
+        const candX = xBase + off;
+        const nHits = countNodeOverlaps(candX, yStart, candX, yEnd, false);
+        const cHits = countExistingCorridorOverlaps(candX, yStart, candX, yEnd, false);
+        const cost = nHits * 100000 + cHits * 120 + Math.abs(candX - xIdeal);
+        if (cost < bestXCost) {
+          bestXCost = cost;
+          bestX = candX;
+          bestXNodeHits = nHits;
+          bestXCorridorHits = cHits;
+        }
+      }
+      if (bestXNodeHits === 0 && bestXCorridorHits === 0 && step * snap > Math.abs(bestX - xIdeal) + snap) {
+        break;
+      }
+    }
+
+    const pA: Point = sumSignedDy >= 0 ? { x: bestX, y: yStart } : { x: bestX, y: yEnd };
+    const pB: Point = sumSignedDy >= 0 ? { x: bestX, y: yEnd } : { x: bestX, y: yStart };
+
+    return evaluateCandidate('V', pA, pB, bestXNodeHits, bestXCorridorHits, hasCleanGap, Math.abs(bestX - xIdeal));
+  };
+
+  const horiz = buildHorizontalCandidate();
+  const vert = buildVerticalCandidate();
+
+  return horiz.score <= vert.score ? horiz.waypoints : vert.waypoints;
+};
+

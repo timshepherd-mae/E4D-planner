@@ -1435,11 +1435,15 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
           <button
             type="button"
             onClick={handleCreateCorridorClick}
-            title="Place a route corridor on the canvas to bunch assigned transfer links into parallel lanes"
+            title={
+              selectedLinkIds.length > 0
+                ? 'Create a best-fit horizontal/vertical route corridor and attach the selected transfer(s)'
+                : 'Place a route corridor on the canvas to bunch assigned transfer links into parallel lanes'
+            }
             style={{
-              backgroundColor: 'rgba(30, 41, 59, 0.95)',
-              color: '#e2e8f0',
-              border: '1px solid #475569',
+              backgroundColor: selectedLinkIds.length > 0 ? 'rgba(56, 189, 248, 0.14)' : 'rgba(30, 41, 59, 0.95)',
+              color: selectedLinkIds.length > 0 ? '#7dd3fc' : '#e2e8f0',
+              border: selectedLinkIds.length > 0 ? '1px solid rgba(56, 189, 248, 0.45)' : '1px solid #475569',
               padding: '6px 10px',
               borderRadius: '4px',
               fontSize: '11px',

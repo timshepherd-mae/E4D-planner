@@ -9,7 +9,7 @@ import { ExportModal } from './components/modal/ExportModal';
 import { RuleConfirmModal } from './components/modal/RuleConfirmModal';
 import { ManualModal } from './components/modal/ManualModal';
 import { CardinalEdge, ContainerNode, TransferLink, RouteCorridor, Point, OverflowMode, StrictSubRule, MaterialDefinition, ClipboardData, ContainerProperties, LinkProperties, getLinkCorridorIds } from './models/types';
-import { getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge } from './components/canvas/pipeRouter';
+import { getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge, computeBestFitCorridorWaypoints } from './components/canvas/pipeRouter';
 
 export default function App() {
   const [vm] = useState(() => new CanvasViewModel());
@@ -168,8 +168,16 @@ export default function App() {
   };
 
   const handleAddCorridor = (suggestedWaypoints?: Point[]) => {
+    const validSelectedLinkIds = selectedLinkIds.filter(lid => links.some(l => l.id === lid));
+    const bestFitWaypoints =
+      validSelectedLinkIds.length > 0
+        ? computeBestFitCorridorWaypoints(nodes, links, validSelectedLinkIds, corridors)
+        : null;
+
     const waypoints: Point[] =
-      suggestedWaypoints && suggestedWaypoints.length >= 2
+      bestFitWaypoints
+        ? bestFitWaypoints.map(p => ({ x: p.x, y: p.y }))
+        : suggestedWaypoints && suggestedWaypoints.length >= 2
         ? suggestedWaypoints.map(p => ({ x: p.x, y: p.y }))
         : [
             { x: 240, y: 240 },
@@ -182,11 +190,26 @@ export default function App() {
       waypoints
     };
     vm.addCorridor(newCorridor);
+
+    let attachedCount = 0;
+    if (validSelectedLinkIds.length > 0) {
+      attachedCount = vm.addLinksToCorridors([newCorridor.id], validSelectedLinkIds);
+      setLinks([...vm.getLinks()]);
+    }
+
     setCorridors(vm.getCorridors().map(c => ({ ...c, waypoints: c.waypoints.map(p => ({ ...p })) })));
     setSelectedCorridorIds([newCorridor.id]);
     setSelectedNodeIds([]);
     setSelectedLinkIds([]);
-    showToast(`Created "${newCorridor.name}". Drag handles on canvas and assign transfers via + lanes or inspector.`, 'success');
+
+    if (attachedCount > 0) {
+      showToast(
+        `Created "${newCorridor.name}" and attached ${attachedCount} transfer${attachedCount > 1 ? 's' : ''}.`,
+        'success'
+      );
+    } else {
+      showToast(`Created "${newCorridor.name}". Drag handles on canvas and assign transfers via + lanes or inspector.`, 'success');
+    }
   };
 
   const handleSetRouteLanes = () => {
