@@ -231,12 +231,17 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
     }, 0);
 
     let status: FlowStatus = 'frozen';
-    if (isPlayback && sharedLinks.length > 0) {
-      const statuses = sharedLinks.map((l) => currentFrame?.linkStatuses?.[l.id] ?? 'frozen');
-      if (statuses.includes('blocked')) status = 'blocked';
-      else if (statuses.includes('restricted')) status = 'restricted';
-      else if (statuses.includes('full')) status = 'full';
-      else if (statuses.includes('starved')) status = 'starved';
+    if (isPlayback) {
+      const explicitCorridorStatus = currentFrame?.corridorStatuses?.[corridorId];
+      if (explicitCorridorStatus) {
+        status = explicitCorridorStatus;
+      } else if (sharedLinks.length > 0) {
+        const statuses = sharedLinks.map((l) => currentFrame?.linkStatuses?.[l.id] ?? 'frozen');
+        if (statuses.includes('blocked')) status = 'blocked';
+        else if (statuses.includes('restricted')) status = 'restricted';
+        else if (statuses.includes('full')) status = 'full';
+        else if (statuses.includes('starved')) status = 'starved';
+      }
     }
 
     return {

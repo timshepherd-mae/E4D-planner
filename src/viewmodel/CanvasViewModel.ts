@@ -1,10 +1,26 @@
-import { CardinalEdge, ContainerNode, TransferLink, SimFrame, MaterialDefinition, RouteCorridor, Point, getLinkCorridorIds } from '../models/types';
+import {
+  CardinalEdge,
+  ContainerNode,
+  TransferLink,
+  SimFrame,
+  MaterialDefinition,
+  RouteCorridor,
+  CalendarModel,
+  CalendarEvent,
+  Point,
+  getLinkCorridorIds
+} from '../models/types';
 import { SimEngine, OverflowMode, StrictSubRule } from '../simulation/SimEngine';
 
 export class CanvasViewModel {
   private nodes: ContainerNode[];
   private links: TransferLink[];
   private corridors: RouteCorridor[] = [];
+  private calendar: CalendarModel = {
+    id: 'calendar-1',
+    name: 'Project Schedule',
+    events: []
+  };
   private materials: MaterialDefinition[];
   private frames: SimFrame[] = [];
   private currentFrameIndex: number = 0;
@@ -189,7 +205,8 @@ export class CanvasViewModel {
     nodes: ContainerNode[],
     links: TransferLink[],
     materials?: MaterialDefinition[],
-    corridors?: RouteCorridor[]
+    corridors?: RouteCorridor[],
+    calendar?: CalendarModel
   ): void {
     if (materials && materials.length > 0) {
       this.materials = materials;
@@ -207,18 +224,64 @@ export class CanvasViewModel {
         return copy;
       });
     this.corridors = corridors ? corridors.map(c => ({ ...c, waypoints: c.waypoints.map(p => ({ ...p })) })) : [];
+
+    const validLinkIds = new Set(this.links.map(l => l.id));
+    const validCorridorIds = new Set(this.corridors.map(c => c.id));
+    if (calendar) {
+      const calId = calendar.id || 'calendar-1';
+      const validEvents = (calendar.events || [])
+        .filter(evt => {
+          if (evt.targetType === 'container') return validNodeIds.has(evt.targetId);
+          if (evt.targetType === 'transfer') return validLinkIds.has(evt.targetId);
+          if (evt.targetType === 'route') return validCorridorIds.has(evt.targetId);
+          return false;
+        })
+        .map(evt => ({
+          ...evt,
+          calendarId: evt.calendarId || calId,
+          startDay: Math.max(1, Math.min(30, Math.round(evt.startDay))),
+          endDay: Math.max(Math.max(1, Math.min(30, Math.round(evt.startDay))), Math.min(30, Math.round(evt.endDay)))
+        }));
+      this.calendar = {
+        id: calId,
+        name: calendar.name || 'Project Schedule',
+        notes: calendar.notes,
+        events: validEvents
+      };
+    } else {
+      this.calendar = {
+        id: 'calendar-1',
+        name: 'Project Schedule',
+        events: []
+      };
+    }
+
     this.currentFrameIndex = 0;
     this.recalculateSimulation();
   }
 
   public recalculateSimulation(): void {
-    const engine = new SimEngine(this.nodes, this.links, this.materials, 30, this.overflowMode);
+    const engine = new SimEngine(
+      this.nodes,
+      this.links,
+      this.materials,
+      30,
+      this.overflowMode,
+      this.corridors,
+      this.calendar
+    );
     this.frames = engine.runSimulation();
   }
 
   public getNodes(): ContainerNode[] { return this.nodes; }
   public getLinks(): TransferLink[] { return this.links; }
   public getCorridors(): RouteCorridor[] { return this.corridors; }
+  public getCalendar(): CalendarModel {
+    return {
+      ...this.calendar,
+      events: this.calendar.events.map(e => ({ ...e }))
+    };
+  }
   public getFrames(): SimFrame[] { return this.frames; }
   public getCurrentFrame(): SimFrame { return this.frames[this.currentFrameIndex] || this.frames[0]; }
   
@@ -244,8 +307,16 @@ export class CanvasViewModel {
   }
 
   public removeNode(id: string): void {
+    const removedLinkIds = new Set(
+      this.links.filter(l => l.sourceId === id || l.targetId === id).map(l => l.id)
+    );
     this.nodes = this.nodes.filter(n => n.id !== id);
     this.links = this.links.filter(l => l.sourceId !== id && l.targetId !== id);
+    this.calendar.events = this.calendar.events.filter(
+      evt =>
+        !(evt.targetType === 'container' && evt.targetId === id) &&
+        !(evt.targetType === 'transfer' && removedLinkIds.has(evt.targetId))
+    );
     this.recalculateSimulation();
   }
 
@@ -256,6 +327,9 @@ export class CanvasViewModel {
 
   public removeLink(id: string): void {
     this.links = this.links.filter(l => l.id !== id);
+    this.calendar.events = this.calendar.events.filter(
+      evt => !(evt.targetType === 'transfer' && evt.targetId === id)
+    );
     this.recalculateSimulation();
   }
 
@@ -310,6 +384,7 @@ export class CanvasViewModel {
 
   public addCorridor(corridor: RouteCorridor): void {
     this.corridors.push(corridor);
+    this.recalculateSimulation();
   }
 
   public removeCorridor(id: string): void {
@@ -320,12 +395,17 @@ export class CanvasViewModel {
       if (nextIds.length > 0) l.corridorIds = nextIds;
       else delete l.corridorIds;
     });
+    this.calendar.events = this.calendar.events.filter(
+      evt => !(evt.targetType === 'route' && evt.targetId === id)
+    );
+    this.recalculateSimulation();
   }
 
   public updateCorridor(id: string, updates: Partial<RouteCorridor>): void {
     const corridor = this.corridors.find(c => c.id === id);
     if (corridor) {
       Object.assign(corridor, updates);
+      this.recalculateSimulation();
     }
   }
 
@@ -372,6 +452,7 @@ export class CanvasViewModel {
     delete link.corridorId;
     if (next.length > 0) link.corridorIds = next;
     else delete link.corridorIds;
+    this.recalculateSimulation();
   }
 
   public addLinksToCorridors(corridorIds: string[], linkIds: string[]): number {
@@ -394,6 +475,7 @@ export class CanvasViewModel {
         link.corridorIds = next;
       }
     });
+    if (addedCount > 0) this.recalculateSimulation();
     return addedCount;
   }
 
@@ -414,6 +496,7 @@ export class CanvasViewModel {
         else delete link.corridorIds;
       }
     });
+    if (count > 0) this.recalculateSimulation();
     return count;
   }
 
@@ -430,6 +513,42 @@ export class CanvasViewModel {
         else delete link.corridorIds;
       }
     });
+    if (count > 0) this.recalculateSimulation();
     return count;
+  }
+
+  public setCalendarMeta(updates: Partial<Pick<CalendarModel, 'name' | 'notes'>>): void {
+    Object.assign(this.calendar, updates);
+  }
+
+  public addCalendarEvent(event: Omit<CalendarEvent, 'calendarId'> & { calendarId?: string }): CalendarEvent {
+    const normalizedStart = Math.max(1, Math.min(30, Math.round(event.startDay)));
+    const normalizedEnd = Math.max(normalizedStart, Math.min(30, Math.round(event.endDay)));
+    const newEvent: CalendarEvent = {
+      ...event,
+      calendarId: event.calendarId || this.calendar.id,
+      startDay: normalizedStart,
+      endDay: normalizedEnd
+    };
+    this.calendar.events.push(newEvent);
+    this.recalculateSimulation();
+    return { ...newEvent };
+  }
+
+  public updateCalendarEvent(eventId: string, updates: Partial<CalendarEvent>): void {
+    const evt = this.calendar.events.find(e => e.id === eventId);
+    if (!evt) return;
+    Object.assign(evt, updates);
+    evt.startDay = Math.max(1, Math.min(30, Math.round(evt.startDay)));
+    evt.endDay = Math.max(evt.startDay, Math.min(30, Math.round(evt.endDay)));
+    this.recalculateSimulation();
+  }
+
+  public removeCalendarEvent(eventId: string): void {
+    const before = this.calendar.events.length;
+    this.calendar.events = this.calendar.events.filter(e => e.id !== eventId);
+    if (this.calendar.events.length !== before) {
+      this.recalculateSimulation();
+    }
   }
 }

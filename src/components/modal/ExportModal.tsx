@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ContainerNode, TransferLink, RouteCorridor, SimFrame, MaterialDefinition, FlowStatus, getLinkCorridorIds } from '../../models/types';
+import { ContainerNode, TransferLink, RouteCorridor, CalendarModel, SimFrame, MaterialDefinition, FlowStatus, getLinkCorridorIds } from '../../models/types';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -7,6 +7,7 @@ interface ExportModalProps {
   nodes: ContainerNode[];
   links: TransferLink[];
   corridors?: RouteCorridor[];
+  calendar?: CalendarModel;
   frames: SimFrame[];
   materials: MaterialDefinition[];
 }
@@ -58,6 +59,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   nodes,
   links,
   corridors = [],
+  calendar,
   frames,
   materials
 }) => {
@@ -137,6 +139,26 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         const linkCorridorIds = getLinkCorridorIds(l);
         const corridorIdVal = linkCorridorIds.length > 0 ? `"${linkCorridorIds.join('|').replace(/"/g, '""')}"` : '""';
         lines.push(`${l.id},${l.sourceId},${l.targetId},${l.dailyRate},${l.fleetCount},${priority},${matId},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${corridorIdVal}`);
+      });
+      lines.push('');
+
+      // 5. Calendar parent metadata
+      const cal: CalendarModel = calendar || { id: 'calendar-1', name: 'Project Schedule', events: [] };
+      lines.push('# SECTION: CALENDAR');
+      lines.push('CalendarID,Name,Notes');
+      const escapedCalName = `"${(cal.name || 'Project Schedule').replace(/"/g, '""')}"`;
+      const escapedCalNotes = `"${(cal.notes || '').replace(/"/g, '""')}"`;
+      lines.push(`${cal.id},${escapedCalName},${escapedCalNotes}`);
+      lines.push('');
+
+      // 6. Calendar Events (children of Calendar)
+      lines.push('# SECTION: CALENDAR EVENTS');
+      lines.push('EventID,CalendarID,TargetType,TargetID,StartDay,EndDay,State,RateValue,Label,Notes');
+      (cal.events || []).forEach(evt => {
+        const rateStr = evt.rateValue !== undefined && Number.isFinite(evt.rateValue) ? `${evt.rateValue}` : '';
+        const escapedLabel = `"${(evt.label || '').replace(/"/g, '""')}"`;
+        const escapedEvtNotes = `"${(evt.notes || '').replace(/"/g, '""')}"`;
+        lines.push(`${evt.id},${evt.calendarId || cal.id},${evt.targetType},${evt.targetId},${evt.startDay},${evt.endDay},${evt.state},${rateStr},${escapedLabel},${escapedEvtNotes}`);
       });
       lines.push('');
     }
@@ -282,6 +304,24 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         materialId: l.materialId || '',
         corridorIds: getLinkCorridorIds(l)
       }));
+      const cal: CalendarModel = calendar || { id: 'calendar-1', name: 'Project Schedule', events: [] };
+      payload.calendar = {
+        id: cal.id,
+        name: cal.name,
+        notes: cal.notes || '',
+        events: (cal.events || []).map(evt => ({
+          id: evt.id,
+          calendarId: evt.calendarId || cal.id,
+          targetType: evt.targetType,
+          targetId: evt.targetId,
+          startDay: evt.startDay,
+          endDay: evt.endDay,
+          state: evt.state,
+          ...(evt.rateValue !== undefined ? { rateValue: evt.rateValue } : {}),
+          ...(evt.label ? { label: evt.label } : {}),
+          ...(evt.notes ? { notes: evt.notes } : {})
+        }))
+      };
     }
 
     if (exportScope === 'all' || exportScope === 'telemetry') {
@@ -696,8 +736,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <span>Containers: <strong style={{ color: '#38bdf8' }}>{nodes.length}</strong></span>
             <span>Transfers: <strong style={{ color: '#38bdf8' }}>{links.length}</strong></span>
             <span>Route Corridors: <strong style={{ color: '#38bdf8' }}>{corridors.length}</strong></span>
+            <span>Calendar Events: <strong style={{ color: '#38bdf8' }}>{calendar?.events?.length ?? 0}</strong></span>
             <span>Sim Frames: <strong style={{ color: '#22c55e' }}>{frames.length} days</strong></span>
-            <span>Colours: <strong style={{ color: '#f59e0b' }}>Blue/Green/Amber/Red</strong></span>
           </div>
         </div>
 

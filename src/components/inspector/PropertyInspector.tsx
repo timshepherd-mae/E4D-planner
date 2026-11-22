@@ -1,5 +1,19 @@
 import React from 'react';
-import { ContainerNode, TransferLink, RouteCorridor, SimFrame, MaterialDefinition, OverflowMode, StrictSubRule, ClipboardData, getLinkCorridorIds } from '../../models/types';
+import {
+  ContainerNode,
+  TransferLink,
+  RouteCorridor,
+  CalendarModel,
+  CalendarEvent,
+  CalendarEventState,
+  CalendarTargetType,
+  SimFrame,
+  MaterialDefinition,
+  OverflowMode,
+  StrictSubRule,
+  ClipboardData,
+  getLinkCorridorIds
+} from '../../models/types';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
 import { resolveOrderedCorridorChain } from '../canvas/pipeRouter';
 import { MaterialDrawer } from './MaterialDrawer';
@@ -15,6 +29,8 @@ interface PropertyInspectorProps {
   singleSelectedNode: ContainerNode | undefined;
   selectedLink: TransferLink | undefined;
   selectedCorridor: RouteCorridor | undefined;
+  calendar: CalendarModel;
+  selectedCalendarEvent: CalendarEvent | undefined;
   corridors: RouteCorridor[];
   links: TransferLink[];
   nodes: ContainerNode[];
@@ -29,6 +45,9 @@ interface PropertyInspectorProps {
   onUpdateSingleNode: (field: keyof ContainerNode, val: any) => void;
   onUpdateLink: (field: keyof TransferLink, val: any) => void;
   onUpdateCorridor: (field: keyof RouteCorridor, val: any) => void;
+  onUpdateCalendarEvent: (eventId: string, updates: Partial<CalendarEvent>) => void;
+  onDeleteCalendarEvent: (eventId: string) => void;
+  onSelectTargetElement: (targetType: CalendarTargetType, targetId: string) => void;
   onToggleLinkCorridor: (linkId: string, corridorId: string, assign: boolean) => void;
   onSetRouteLanes: () => void;
   onUnlinkLanes: () => void;
@@ -49,6 +68,8 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   singleSelectedNode,
   selectedLink,
   selectedCorridor,
+  calendar,
+  selectedCalendarEvent,
   corridors,
   links,
   nodes,
@@ -63,6 +84,9 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   onUpdateSingleNode,
   onUpdateLink,
   onUpdateCorridor,
+  onUpdateCalendarEvent,
+  onDeleteCalendarEvent,
+  onSelectTargetElement,
   onToggleLinkCorridor,
   onSetRouteLanes,
   onUnlinkLanes,
@@ -70,10 +94,67 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   onClearSelection,
   onMaterialsUpdated,
 }) => {
-  const isPureNode = selectedNodeIds.length > 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 0;
-  const isPureSingleLink = selectedNodeIds.length === 0 && selectedLinkIds.length === 1 && selectedCorridorIds.length === 0;
-  const isPureSingleCorridor = selectedNodeIds.length === 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 1;
-  const isMixedOrMultiOther = hasSelection && !isPureNode && !isPureSingleLink && !isPureSingleCorridor;
+  const isCalendarEventSelected = Boolean(selectedCalendarEvent);
+  const isPureNode = !isCalendarEventSelected && selectedNodeIds.length > 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 0;
+  const isPureSingleLink = !isCalendarEventSelected && selectedNodeIds.length === 0 && selectedLinkIds.length === 1 && selectedCorridorIds.length === 0;
+  const isPureSingleCorridor = !isCalendarEventSelected && selectedNodeIds.length === 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 1;
+  const isMixedOrMultiOther = !isCalendarEventSelected && hasSelection && !isPureNode && !isPureSingleLink && !isPureSingleCorridor;
+
+  const getCalendarTargetInfo = (evt: CalendarEvent): { typeLabel: string; name: string; baseSummary: string } => {
+    if (evt.targetType === 'container') {
+      const node = nodes.find(n => n.id === evt.targetId);
+      const baseStatus = node?.status || 'active';
+      return {
+        typeLabel: 'Container',
+        name: node?.name || evt.targetId,
+        baseSummary: `Default: ${baseStatus === 'active' ? 'Open' : baseStatus}`
+      };
+    }
+    if (evt.targetType === 'transfer') {
+      const link = links.find(l => l.id === evt.targetId);
+      const src = link ? nodes.find(n => n.id === link.sourceId) : undefined;
+      const tgt = link ? nodes.find(n => n.id === link.targetId) : undefined;
+      return {
+        typeLabel: 'Transfer',
+        name: link ? `${src?.name || link.sourceId} → ${tgt?.name || link.targetId}` : evt.targetId,
+        baseSummary: link ? `Stated rate: ${Math.round(link.dailyRate).toLocaleString()} m³/d` : ''
+      };
+    }
+    const corridor = corridors.find(c => c.id === evt.targetId);
+    const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(evt.targetId));
+    const combinedRate = assignedLinks.reduce((sum, l) => sum + (l.dailyRate || 0), 0);
+    return {
+      typeLabel: 'Route Corridor',
+      name: corridor?.name || evt.targetId,
+      baseSummary: `${assignedLinks.length} transfer${assignedLinks.length === 1 ? '' : 's'} · ${Math.round(combinedRate).toLocaleString()} m³/d combined`
+    };
+  };
+
+  const getActiveCalendarEventForTarget = (targetType: CalendarTargetType, targetId: string): CalendarEvent | undefined => {
+    if (currentDay < 1) return undefined;
+    return calendar.events.find(
+      e => e.targetType === targetType && e.targetId === targetId && currentDay >= e.startDay && currentDay <= e.endDay
+    );
+  };
+
+  const getClampedDayRange = (evt: CalendarEvent, desiredStart: number, desiredEnd: number): { startDay: number; endDay: number } => {
+    const others = calendar.events.filter(
+      e => e.id !== evt.id && e.targetType === evt.targetType && e.targetId === evt.targetId
+    );
+    const prevEnd = others.reduce(
+      (maxEnd, o) => (o.endDay < evt.startDay ? Math.max(maxEnd, o.endDay) : maxEnd),
+      0
+    );
+    const nextStart = others.reduce(
+      (minStart, o) => (o.startDay > evt.endDay ? Math.min(minStart, o.startDay) : minStart),
+      31
+    );
+    const minAllowed = prevEnd + 1;
+    const maxAllowed = nextStart - 1;
+    const s = Math.max(minAllowed, Math.min(maxAllowed, Math.round(desiredStart)));
+    const e = Math.max(s, Math.min(maxAllowed, Math.round(desiredEnd)));
+    return { startDay: s, endDay: e };
+  };
 
   const selectedKind: 'container' | 'link' | 'none' = 
     isPureNode ? 'container' :
@@ -275,14 +356,59 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#22c55e' }}>Day {currentDay} of 30</div>
           </div>
 
+          {/* Selected Calendar Event Read-Only Inspection in Playback */}
+          {selectedCalendarEvent && (() => {
+            const info = getCalendarTargetInfo(selectedCalendarEvent);
+            const isActiveToday =
+              currentDay >= 1 &&
+              currentDay >= selectedCalendarEvent.startDay &&
+              currentDay <= selectedCalendarEvent.endDay;
+            return (
+              <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', color: '#38bdf8', fontWeight: 700, textTransform: 'uppercase' }}>
+                    CALENDAR EVENT ({info.typeLabel})
+                  </span>
+                  <span style={{ fontSize: '10px', fontWeight: 700, color: isActiveToday ? '#22c55e' : '#64748b' }}>
+                    {isActiveToday ? 'ACTIVE TODAY' : 'INACTIVE'}
+                  </span>
+                </div>
+                <div style={{ fontSize: '13px', fontWeight: 700, color: '#f8fafc' }}>{info.name}</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
+                  <span>Schedule Window:</span>
+                  <span style={{ fontWeight: 600 }}>Day {selectedCalendarEvent.startDay} – Day {selectedCalendarEvent.endDay}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1' }}>
+                  <span>State Override:</span>
+                  <span style={{ fontWeight: 700, textTransform: 'uppercase', color: selectedCalendarEvent.state === 'blocked' || selectedCalendarEvent.state === 'stopped' ? '#ef4444' : selectedCalendarEvent.state === 'restricted' || selectedCalendarEvent.state === 'variable' ? '#f59e0b' : '#22c55e' }}>
+                    {selectedCalendarEvent.state}
+                  </span>
+                </div>
+                {(selectedCalendarEvent.state === 'variable' || selectedCalendarEvent.state === 'restricted') && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
+                    <span>{selectedCalendarEvent.state === 'restricted' ? 'Combined Cap:' : 'Target Rate:'}</span>
+                    <span style={{ fontWeight: 600 }}>{Math.round(selectedCalendarEvent.rateValue ?? 0).toLocaleString()} m³/d</span>
+                  </div>
+                )}
+                {selectedCalendarEvent.notes && (
+                  <div style={{ marginTop: '2px', padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
+                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>NOTES</div>
+                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedCalendarEvent.notes}</div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           {/* Selected Container Live Telemetry */}
           {selectedNodeIds.length === 1 && singleSelectedNode && (() => {
             const liveVol = currentFrame ? (currentFrame.nodeVolumes[singleSelectedNode.id] ?? singleSelectedNode.currentVolume) : singleSelectedNode.currentVolume;
             const nodeStatus = currentFrame?.nodeStatuses?.[singleSelectedNode.id] ?? 'frozen';
+            const activeCalEvt = getActiveCalendarEventForTarget('container', singleSelectedNode.id);
             const statusConfig = {
               full: { label: 'Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
               restricted: { label: 'Flowing at Restricted Rate', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
-              blocked: { label: 'Blocked (Capacity Constraint)', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
+              blocked: { label: activeCalEvt?.state === 'blocked' ? 'Blocked (Calendar Event)' : 'Blocked (Capacity Constraint)', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
               starved: { label: 'Cannot Deliver (Lack of Material)', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Inactive / Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
@@ -300,7 +426,13 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   {statusConfig.label}
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1' }}>
+                {activeCalEvt && (
+                  <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
+                    Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong> (D{activeCalEvt.startDay}–D{activeCalEvt.endDay})
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
                   <span>Live Volume:</span>
                   <span style={{ fontWeight: 600 }}>{Math.round(liveVol).toLocaleString()} / {Math.round(singleSelectedNode.capacity).toLocaleString()} m³ ({fillPct}%)</span>
                 </div>
@@ -323,11 +455,12 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             const linkStatus = currentFrame?.linkStatuses?.[selectedLink.id] ?? 'frozen';
             const source = vm.getNodes().find(n => n.id === selectedLink.sourceId);
             const target = vm.getNodes().find(n => n.id === selectedLink.targetId);
+            const activeCalEvt = getActiveCalendarEventForTarget('transfer', selectedLink.id);
 
             const statusConfig = {
               full: { label: 'Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
               restricted: { label: 'Flowing at Restricted Rate', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
-              blocked: { label: 'Blocked (Capacity Constraint)', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
+              blocked: { label: activeCalEvt?.state === 'stopped' ? 'Stopped (Calendar Event)' : 'Blocked (Capacity / Schedule)', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
               starved: { label: 'Cannot Deliver (Lack of Material)', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Inactive / Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
@@ -343,7 +476,14 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   {statusConfig.label}
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1' }}>
+                {activeCalEvt && (
+                  <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
+                    Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong>
+                    {activeCalEvt.state === 'variable' ? ` (${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d)` : ''} · D{activeCalEvt.startDay}–D{activeCalEvt.endDay}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
                   <span>Transfer Rate:</span>
                   <span style={{ fontWeight: 600 }}>{Math.round(linkFlow).toLocaleString()} / {Math.round(selectedLink.dailyRate).toLocaleString()} m³/d</span>
                 </div>
@@ -353,6 +493,45 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedLink.notes}</div>
                   </div>
                 )}
+              </div>
+            );
+          })()}
+
+          {/* Selected Route Corridor Live Telemetry */}
+          {selectedCorridor && (() => {
+            const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(selectedCorridor.id));
+            const combinedLiveFlow = assignedLinks.reduce((sum, l) => sum + (currentFrame?.linkFlows?.[l.id] ?? 0), 0);
+            const combinedPlanned = assignedLinks.reduce((sum, l) => sum + l.dailyRate, 0);
+            const corridorStatus = currentFrame?.corridorStatuses?.[selectedCorridor.id] ?? 'frozen';
+            const activeCalEvt = getActiveCalendarEventForTarget('route', selectedCorridor.id);
+
+            const statusConfig = {
+              full: { label: 'Open / Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
+              restricted: { label: 'Restricted Route Cap Active', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
+              blocked: { label: 'Route Blocked', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
+              starved: { label: 'Assigned Sources Starved', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
+              frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Idle / No Flow', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
+              idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
+            }[corridorStatus] || { label: 'Frozen', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' };
+
+            return (
+              <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>ROUTE CORRIDOR TELEMETRY</div>
+                <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#f8fafc' }}>{selectedCorridor.name}</div>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 8px', borderRadius: '4px', backgroundColor: statusConfig.bg, border: `1px solid ${statusConfig.border}`, color: statusConfig.color, fontSize: '11px', fontWeight: 600, width: 'fit-content' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: statusConfig.color }} />
+                  {statusConfig.label}
+                </div>
+                {activeCalEvt && (
+                  <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
+                    Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong>
+                    {activeCalEvt.state === 'restricted' ? ` (Cap ${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d pro-rata)` : ''} · D{activeCalEvt.startDay}–D{activeCalEvt.endDay}
+                  </div>
+                )}
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
+                  <span>Combined Corridor Flow:</span>
+                  <span style={{ fontWeight: 600 }}>{Math.round(combinedLiveFlow).toLocaleString()} / {Math.round(combinedPlanned).toLocaleString()} m³/d</span>
+                </div>
               </div>
             );
           })()}
@@ -397,6 +576,223 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
         </div>
       ) : (
         <>
+          {isCalendarEventSelected && selectedCalendarEvent && (() => {
+            const info = getCalendarTargetInfo(selectedCalendarEvent);
+            const targetLink = selectedCalendarEvent.targetType === 'transfer'
+              ? links.find(l => l.id === selectedCalendarEvent.targetId)
+              : undefined;
+
+            const handleStateChange = (nextState: CalendarEventState) => {
+              const updates: Partial<CalendarEvent> = { state: nextState };
+              if (nextState === 'variable' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
+                updates.rateValue = targetLink ? Math.round((targetLink.dailyRate * 0.5) / 50) * 50 : 500;
+              } else if (nextState === 'restricted' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
+                const assigned = links.filter(l => getLinkCorridorIds(l).includes(selectedCalendarEvent.targetId));
+                const combined = assigned.reduce((s, l) => s + l.dailyRate, 0);
+                updates.rateValue = combined > 0 ? Math.max(50, Math.round((combined * 0.5) / 50) * 50) : 1000;
+              }
+              onUpdateCalendarEvent(selectedCalendarEvent.id, updates);
+            };
+
+            const durationDays = selectedCalendarEvent.endDay - selectedCalendarEvent.startDay + 1;
+
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '120px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px', border: '1px solid #334155' }}>
+                  <span>
+                    Selected: <strong style={{ color: '#38bdf8' }}>Calendar Event</strong>
+                  </span>
+                  <span style={{ fontSize: '10px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontVariantNumeric: 'tabular-nums', color: '#cbd5e1' }}>
+                    {durationDays}d
+                  </span>
+                </div>
+
+                {/* Target Element Summary */}
+                <div style={{ backgroundColor: '#0f172a', padding: '10px 12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                    <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: '#94a3b8' }}>
+                      {info.typeLabel}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onSelectTargetElement(selectedCalendarEvent.targetType, selectedCalendarEvent.targetId)}
+                      style={{
+                        background: 'none',
+                        border: '1px solid #475569',
+                        borderRadius: '4px',
+                        color: '#38bdf8',
+                        fontSize: '10px',
+                        fontWeight: 600,
+                        padding: '2px 7px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Select on Canvas
+                    </button>
+                  </div>
+                  <div style={{ fontSize: '13px', fontWeight: 700, color: '#f8fafc', wordBreak: 'break-word' }}>
+                    {info.name}
+                  </div>
+                  {info.baseSummary && (
+                    <div style={{ fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
+                      {info.baseSummary}
+                    </div>
+                  )}
+                </div>
+
+                {/* Start / End Day Controls */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Start Day (1–30)</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      value={selectedCalendarEvent.startDay}
+                      onChange={e => {
+                        const raw = Number(e.target.value);
+                        if (!Number.isFinite(raw)) return;
+                        const clamped = getClampedDayRange(selectedCalendarEvent, raw, Math.max(raw, selectedCalendarEvent.endDay));
+                        onUpdateCalendarEvent(selectedCalendarEvent.id, clamped);
+                      }}
+                      style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>End Day (1–30)</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      value={selectedCalendarEvent.endDay}
+                      onChange={e => {
+                        const raw = Number(e.target.value);
+                        if (!Number.isFinite(raw)) return;
+                        const clamped = getClampedDayRange(selectedCalendarEvent, Math.min(selectedCalendarEvent.startDay, raw), raw);
+                        onUpdateCalendarEvent(selectedCalendarEvent.id, clamped);
+                      }}
+                      style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }}
+                    />
+                  </div>
+                </div>
+
+                {/* Event State Control */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Scheduled State</label>
+                  <select
+                    value={selectedCalendarEvent.state}
+                    onChange={e => handleStateChange(e.target.value as CalendarEventState)}
+                    style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontWeight: 600 }}
+                  >
+                    {selectedCalendarEvent.targetType === 'container' && (
+                      <>
+                        <option value="open">Open (Normal Inbound & Outbound)</option>
+                        <option value="blocked">Blocked (Halt Inbound & Outbound)</option>
+                      </>
+                    )}
+                    {selectedCalendarEvent.targetType === 'transfer' && (
+                      <>
+                        <option value="max">Max (100% Stated Rate)</option>
+                        <option value="variable">Variable Rate (Custom m³/d)</option>
+                        <option value="stopped">Stopped (0 m³/d)</option>
+                      </>
+                    )}
+                    {selectedCalendarEvent.targetType === 'route' && (
+                      <>
+                        <option value="open">Open (Unrestricted)</option>
+                        <option value="restricted">Restricted (Combined Pro-Rata Cap)</option>
+                        <option value="blocked">Blocked (Halt All Assigned Transfers)</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                {/* Conditional Rate Value input */}
+                {((selectedCalendarEvent.targetType === 'transfer' && selectedCalendarEvent.state === 'variable') ||
+                  (selectedCalendarEvent.targetType === 'route' && selectedCalendarEvent.state === 'restricted')) && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>
+                      {selectedCalendarEvent.targetType === 'route'
+                        ? 'Combined Route Daily Cap (m³/day)'
+                        : 'Override Transfer Rate (m³/day)'}
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step={50}
+                      value={selectedCalendarEvent.rateValue ?? 0}
+                      onChange={e => onUpdateCalendarEvent(selectedCalendarEvent.id, { rateValue: Math.max(0, Number(e.target.value) || 0) })}
+                      style={{ backgroundColor: '#0f172a', border: '1px solid #f59e0b', borderRadius: '4px', color: '#fde68a', padding: '8px', fontSize: '12px', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}
+                    />
+                    <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.4 }}>
+                      {selectedCalendarEvent.targetType === 'route'
+                        ? 'Splits this combined daily rate cap pro-rata across all active transfers assigned to this route.'
+                        : targetLink
+                        ? `Overrides stated rate of ${Math.round(targetLink.dailyRate).toLocaleString()} m³/d during Day ${selectedCalendarEvent.startDay}–${selectedCalendarEvent.endDay}.`
+                        : 'Overrides daily transfer rate during this window.'}
+                    </div>
+                  </div>
+                )}
+
+                {/* Optional Label */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Bar Label (Optional)</label>
+                  <input
+                    type="text"
+                    value={selectedCalendarEvent.label || ''}
+                    onChange={e => onUpdateCalendarEvent(selectedCalendarEvent.id, { label: e.target.value })}
+                    placeholder="e.g. Plant Service, Rain Delay, Night Shift..."
+                    style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
+                  />
+                </div>
+
+                {/* Event Notes */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
+                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                  </div>
+                  <textarea
+                    value={selectedCalendarEvent.notes || ''}
+                    onChange={e => onUpdateCalendarEvent(selectedCalendarEvent.id, { notes: e.target.value })}
+                    placeholder="Scheduling reason, permit window, traffic restriction details..."
+                    rows={3}
+                    style={{
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #475569',
+                      borderRadius: '4px',
+                      color: '#f8fafc',
+                      padding: '8px',
+                      fontSize: '12px',
+                      resize: 'vertical',
+                      fontFamily: 'inherit',
+                      lineHeight: 1.4
+                    }}
+                  />
+                </div>
+
+                {/* Delete Event Button */}
+                <button
+                  type="button"
+                  onClick={() => onDeleteCalendarEvent(selectedCalendarEvent.id)}
+                  style={{
+                    backgroundColor: 'rgba(239, 68, 68, 0.16)',
+                    color: '#fca5a5',
+                    border: '1px solid rgba(239, 68, 68, 0.45)',
+                    borderRadius: '4px',
+                    padding: '8px 12px',
+                    fontSize: '11px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    marginTop: '4px'
+                  }}
+                >
+                  Delete Event
+                </button>
+              </div>
+            );
+          })()}
+
           {isPureNode && selectedNodeIds.length === 1 && singleSelectedNode && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '150px' }}>
               <div style={{ fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px' }}>
@@ -941,10 +1337,10 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               );
             })()}
 
-            {!hasSelection && (
+            {!hasSelection && !isCalendarEventSelected && (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '250px', color: '#64748b', textAlign: 'center', fontSize: '12px', gap: '8px' }}>
                 <div>No entity selected</div>
-                <div style={{ fontSize: '11px' }}>Click containers, transfer links, or route corridors to inspect and edit properties.</div>
+                <div style={{ fontSize: '11px' }}>Click containers, transfer links, route corridors, or calendar event bars to inspect and edit properties.</div>
               </div>
             )}
         </>

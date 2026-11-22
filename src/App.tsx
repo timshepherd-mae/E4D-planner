@@ -8,7 +8,24 @@ import { PropertyInspector } from './components/inspector/PropertyInspector';
 import { ExportModal } from './components/modal/ExportModal';
 import { RuleConfirmModal } from './components/modal/RuleConfirmModal';
 import { ManualModal } from './components/modal/ManualModal';
-import { CardinalEdge, ContainerNode, TransferLink, RouteCorridor, Point, OverflowMode, StrictSubRule, MaterialDefinition, ClipboardData, ContainerProperties, LinkProperties, getLinkCorridorIds } from './models/types';
+import {
+  CardinalEdge,
+  ContainerNode,
+  TransferLink,
+  RouteCorridor,
+  CalendarModel,
+  CalendarEvent,
+  CalendarEventState,
+  CalendarTargetType,
+  Point,
+  OverflowMode,
+  StrictSubRule,
+  MaterialDefinition,
+  ClipboardData,
+  ContainerProperties,
+  LinkProperties,
+  getLinkCorridorIds
+} from './models/types';
 import { getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge, computeBestFitCorridorWaypoints } from './components/canvas/pipeRouter';
 
 export default function App() {
@@ -16,11 +33,13 @@ export default function App() {
   const [nodes, setNodes] = useState(vm.getNodes());
   const [links, setLinks] = useState(vm.getLinks());
   const [corridors, setCorridors] = useState(vm.getCorridors());
+  const [calendar, setCalendar] = useState<CalendarModel>(() => vm.getCalendar());
   const [materials, setMaterials] = useState(vm.getMaterials());
   
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(['node-1']);
   const [selectedLinkIds, setSelectedLinkIds] = useState<string[]>([]);
   const [selectedCorridorIds, setSelectedCorridorIds] = useState<string[]>([]);
+  const [selectedCalendarEventId, setSelectedCalendarEventId] = useState<string | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardData | null>(null);
   const [isPlayback, setIsPlayback] = useState<boolean>(false);
   const [highlightedNodeIds, setHighlightedNodeIds] = useState<string[]>([]);
@@ -48,10 +67,11 @@ export default function App() {
       // Upon playback mode, reset timeline to day 0
       setCurrentDay(0);
       vm.setFrameIndex(0);
-      // When playback mode starts, deselect any containers, transfers, or corridors
+      // When playback mode starts, deselect any containers, transfers, corridors, or calendar events
       setSelectedNodeIds([]);
       setSelectedLinkIds([]);
       setSelectedCorridorIds([]);
+      setSelectedCalendarEventId(null);
       setHighlightedNodeIds([]);
     } else {
       setHighlightedNodeIds([]);
@@ -143,6 +163,7 @@ export default function App() {
     setSelectedNodeIds([newNode.id]);
     setSelectedLinkIds([]);
     setSelectedCorridorIds([]);
+    setSelectedCalendarEventId(null);
 
     if (sourceNode) {
       showToast(`Created "${newName}" copying properties from "${sourceNode.name}"`, 'success');
@@ -165,6 +186,7 @@ export default function App() {
     setSelectedNodeIds([]);
     setSelectedLinkIds([newLink.id]);
     setSelectedCorridorIds([]);
+    setSelectedCalendarEventId(null);
   };
 
   const handleAddCorridor = (suggestedWaypoints?: Point[]) => {
@@ -201,6 +223,7 @@ export default function App() {
     setSelectedCorridorIds([newCorridor.id]);
     setSelectedNodeIds([]);
     setSelectedLinkIds([]);
+    setSelectedCalendarEventId(null);
 
     if (attachedCount > 0) {
       showToast(
@@ -273,6 +296,12 @@ export default function App() {
 
   const handleDeleteSelected = useCallback(() => {
     if (isPlayback) return;
+    if (selectedCalendarEventId) {
+      vm.removeCalendarEvent(selectedCalendarEventId);
+      setCalendar(vm.getCalendar());
+      setSelectedCalendarEventId(null);
+      return;
+    }
     if (selectedNodeIds.length === 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 0) return;
     selectedNodeIds.forEach(id => vm.removeNode(id));
     selectedLinkIds.forEach(id => vm.removeLink(id));
@@ -280,15 +309,86 @@ export default function App() {
     setNodes(vm.getNodes().map(n => ({ ...n })));
     setLinks([...vm.getLinks()]);
     setCorridors(vm.getCorridors().map(c => ({ ...c, waypoints: c.waypoints.map(p => ({ ...p })) })));
+    setCalendar(vm.getCalendar());
     setSelectedNodeIds([]);
     setSelectedLinkIds([]);
     setSelectedCorridorIds([]);
-  }, [isPlayback, selectedNodeIds, selectedLinkIds, selectedCorridorIds, vm]);
+  }, [isPlayback, selectedCalendarEventId, selectedNodeIds, selectedLinkIds, selectedCorridorIds, vm]);
 
   const handleClearSelection = useCallback(() => {
     setSelectedNodeIds([]);
     setSelectedLinkIds([]);
     setSelectedCorridorIds([]);
+    setSelectedCalendarEventId(null);
+  }, []);
+
+  const handleSelectCalendarEvent = useCallback((eventId: string | null) => {
+    setSelectedCalendarEventId(eventId);
+    if (eventId) {
+      setSelectedNodeIds([]);
+      setSelectedLinkIds([]);
+      setSelectedCorridorIds([]);
+    }
+  }, []);
+
+  const handleSelectTargetElement = useCallback((targetType: CalendarTargetType, targetId: string) => {
+    setSelectedCalendarEventId(null);
+    if (targetType === 'container') {
+      setSelectedNodeIds([targetId]);
+      setSelectedLinkIds([]);
+      setSelectedCorridorIds([]);
+    } else if (targetType === 'transfer') {
+      setSelectedNodeIds([]);
+      setSelectedLinkIds([targetId]);
+      setSelectedCorridorIds([]);
+    } else {
+      setSelectedNodeIds([]);
+      setSelectedLinkIds([]);
+      setSelectedCorridorIds([targetId]);
+    }
+  }, []);
+
+  const handleAddCalendarEvent = useCallback(
+    (event: Omit<CalendarEvent, 'calendarId'>): CalendarEvent => {
+      const created = vm.addCalendarEvent(event);
+      setCalendar(vm.getCalendar());
+      return created;
+    },
+    [vm]
+  );
+
+  const handleUpdateCalendarEvent = useCallback(
+    (eventId: string, updates: Partial<CalendarEvent>) => {
+      if (isPlayback) return;
+      vm.updateCalendarEvent(eventId, updates);
+      setCalendar(vm.getCalendar());
+    },
+    [isPlayback, vm]
+  );
+
+  const handleDeleteCalendarEvent = useCallback(
+    (eventId: string) => {
+      if (isPlayback) return;
+      vm.removeCalendarEvent(eventId);
+      setCalendar(vm.getCalendar());
+      setSelectedCalendarEventId(prev => (prev === eventId ? null : prev));
+    },
+    [isPlayback, vm]
+  );
+
+  const handleCanvasSelectNodes = useCallback((updater: React.SetStateAction<string[]>) => {
+    setSelectedCalendarEventId(null);
+    setSelectedNodeIds(updater);
+  }, []);
+
+  const handleCanvasSelectLinks = useCallback((updater: React.SetStateAction<string[]>) => {
+    setSelectedCalendarEventId(null);
+    setSelectedLinkIds(updater);
+  }, []);
+
+  const handleCanvasSelectCorridors = useCallback((updater: React.SetStateAction<string[]>) => {
+    setSelectedCalendarEventId(null);
+    setSelectedCorridorIds(updater);
   }, []);
 
   const handleNodesUpdated = () => {
@@ -328,6 +428,8 @@ export default function App() {
         const parsedNodes: ContainerNode[] = [];
         const parsedLinks: TransferLink[] = [];
         const parsedCorridors: RouteCorridor[] = [];
+        let parsedCalendarMeta: { id: string; name: string; notes?: string } | null = null;
+        const parsedCalendarEvents: CalendarEvent[] = [];
         let currentSection = '';
         let nodeHeaderCols: string[] = [];
         let linkHeaderCols: string[] = [];
@@ -349,6 +451,12 @@ export default function App() {
             currentSection = 'LINKS';
             linkHeaderCols = [];
             continue;
+          } else if (trimmed.startsWith('# SECTION: CALENDAR EVENTS')) {
+            currentSection = 'CALENDAR_EVENTS';
+            continue;
+          } else if (trimmed.startsWith('# SECTION: CALENDAR')) {
+            currentSection = 'CALENDAR';
+            continue;
           } else if (trimmed.startsWith('# SECTION:')) {
             currentSection = '';
             continue;
@@ -366,6 +474,8 @@ export default function App() {
           }
           if (
             trimmed.toLowerCase().startsWith('corridorid,') ||
+            trimmed.toLowerCase().startsWith('calendarid,') ||
+            trimmed.toLowerCase().startsWith('eventid,') ||
             trimmed.toLowerCase().startsWith('code,') ||
             trimmed.toLowerCase().startsWith('day,')
           ) {
@@ -522,6 +632,60 @@ export default function App() {
                 notes: notes || undefined
               });
             }
+          } else if (currentSection === 'CALENDAR') {
+            // Format: CalendarID,Name,Notes
+            const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+            if (parts.length >= 2) {
+              const id = parts[0].replace(/^"|"$/g, '').trim() || 'calendar-1';
+              const name = parts[1].replace(/^"|"$/g, '').replace(/""/g, '"').trim() || 'Project Schedule';
+              const notes = parts[2] ? parts[2].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : undefined;
+              parsedCalendarMeta = { id, name, notes: notes || undefined };
+            }
+          } else if (currentSection === 'CALENDAR_EVENTS') {
+            // Format: EventID,CalendarID,TargetType,TargetID,StartDay,EndDay,State,RateValue,Label,Notes
+            const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+            if (parts.length >= 7) {
+              const id = parts[0].replace(/^"|"$/g, '').trim();
+              const calendarId = parts[1].replace(/^"|"$/g, '').trim() || parsedCalendarMeta?.id || 'calendar-1';
+              const rawTargetType = parts[2].replace(/^"|"$/g, '').trim().toLowerCase();
+              const targetId = parts[3].replace(/^"|"$/g, '').trim();
+              const startDay = parseInt(parts[4], 10);
+              const endDay = parseInt(parts[5], 10);
+              const rawState = parts[6].replace(/^"|"$/g, '').trim().toLowerCase();
+              const rawRate = parts[7] !== undefined ? parts[7].replace(/^"|"$/g, '').trim() : '';
+              const rateValue = rawRate !== '' && !isNaN(parseFloat(rawRate)) ? parseFloat(rawRate) : undefined;
+              const label = parts[8] ? parts[8].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : undefined;
+              const notes = parts[9] ? parts[9].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : undefined;
+
+              const validTargetTypes: CalendarTargetType[] = ['container', 'transfer', 'route'];
+              const validStatesByType: Record<CalendarTargetType, CalendarEventState[]> = {
+                container: ['open', 'blocked'],
+                transfer: ['max', 'variable', 'stopped'],
+                route: ['open', 'restricted', 'blocked']
+              };
+
+              if (
+                id &&
+                targetId &&
+                validTargetTypes.includes(rawTargetType as CalendarTargetType) &&
+                !isNaN(startDay) &&
+                !isNaN(endDay) &&
+                validStatesByType[rawTargetType as CalendarTargetType].includes(rawState as CalendarEventState)
+              ) {
+                parsedCalendarEvents.push({
+                  id,
+                  calendarId,
+                  targetType: rawTargetType as CalendarTargetType,
+                  targetId,
+                  startDay,
+                  endDay,
+                  state: rawState as CalendarEventState,
+                  ...(rateValue !== undefined ? { rateValue } : {}),
+                  ...(label ? { label } : {}),
+                  ...(notes ? { notes } : {})
+                });
+              }
+            }
           }
         }
 
@@ -535,11 +699,22 @@ export default function App() {
             return true;
           });
 
+          const parsedCalendar: CalendarModel | undefined =
+            parsedCalendarMeta || parsedCalendarEvents.length > 0
+              ? {
+                  id: parsedCalendarMeta?.id || 'calendar-1',
+                  name: parsedCalendarMeta?.name || 'Project Schedule',
+                  notes: parsedCalendarMeta?.notes,
+                  events: parsedCalendarEvents
+                }
+              : undefined;
+
           vm.loadModel(
             parsedNodes,
             validParsedLinks,
             parsedMaterials.length > 0 ? parsedMaterials : undefined,
-            parsedCorridors
+            parsedCorridors,
+            parsedCalendar
           );
           // When a new model is loaded, reset timeline to day 0
           vm.setFrameIndex(0);
@@ -550,14 +725,18 @@ export default function App() {
           setNodes([...vm.getNodes()]);
           setLinks([...vm.getLinks()]);
           setCorridors(vm.getCorridors().map(c => ({ ...c, waypoints: c.waypoints.map(p => ({ ...p })) })));
+          setCalendar(vm.getCalendar());
           setMaterials([...vm.getMaterials()]);
           setSelectedNodeIds([parsedNodes[0].id]);
           setSelectedLinkIds([]);
           setSelectedCorridorIds([]);
+          setSelectedCalendarEventId(null);
 
+          const importedCalCount = vm.getCalendar().events.length;
           const matSummary = parsedMaterials.length > 0 ? `, ${parsedMaterials.length} materials (with bulking factors)` : '';
           const corridorSummary = parsedCorridors.length > 0 ? `, ${parsedCorridors.length} route corridors` : '';
-          showToast(`Successfully imported ${parsedNodes.length} nodes, ${validParsedLinks.length} links${corridorSummary}${matSummary}!`, 'success');
+          const calSummary = importedCalCount > 0 ? `, ${importedCalCount} calendar event${importedCalCount > 1 ? 's' : ''}` : '';
+          showToast(`Successfully imported ${parsedNodes.length} nodes, ${validParsedLinks.length} links${corridorSummary}${calSummary}${matSummary}!`, 'success');
         } else {
           showToast('No valid nodes found in CSV file.', 'error');
         }
@@ -571,15 +750,20 @@ export default function App() {
     e.target.value = '';
   };
 
-  const isPureNodeSelection = selectedNodeIds.length > 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 0;
-  const isPureSingleLink = selectedNodeIds.length === 0 && selectedLinkIds.length === 1 && selectedCorridorIds.length === 0;
-  const isPureSingleCorridor = selectedNodeIds.length === 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 1;
+  const selectedCalendarEvent = selectedCalendarEventId
+    ? calendar.events.find(e => e.id === selectedCalendarEventId)
+    : undefined;
+
+  const isPureNodeSelection = !selectedCalendarEvent && selectedNodeIds.length > 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 0;
+  const isPureSingleLink = !selectedCalendarEvent && selectedNodeIds.length === 0 && selectedLinkIds.length === 1 && selectedCorridorIds.length === 0;
+  const isPureSingleCorridor = !selectedCalendarEvent && selectedNodeIds.length === 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 1;
 
   const singleSelectedNode = isPureNodeSelection && selectedNodeIds.length === 1 ? nodes.find(n => n.id === selectedNodeIds[0]) : undefined;
   const selectedLink = isPureSingleLink ? links.find(l => l.id === selectedLinkIds[0]) : undefined;
   const selectedCorridor = isPureSingleCorridor ? corridors.find(c => c.id === selectedCorridorIds[0]) : undefined;
 
   const hasSelection = selectedNodeIds.length > 0 || selectedLinkIds.length > 0 || selectedCorridorIds.length > 0;
+  const hasDeletableSelection = hasSelection || Boolean(selectedCalendarEvent);
   const canLink = selectedNodeIds.length >= 2;
   const canSetLanes = selectedCorridorIds.length >= 1 && selectedLinkIds.length >= 1;
   const hasSelectedLinkedToSelectedCorridors =
@@ -789,7 +973,7 @@ export default function App() {
         return;
       }
 
-      if ((e.key === 'Delete' || e.key === 'Backspace') && !isPlayback && hasSelection) {
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !isPlayback && hasDeletableSelection) {
         e.preventDefault();
         handleDeleteSelected();
         return;
@@ -825,7 +1009,7 @@ export default function App() {
     return () => {
       window.removeEventListener('keydown', handleKeyDown, true);
     };
-  }, [handleCopy, handlePaste, handleDeleteSelected, handleCycleContainerOutputEdge, handleCycleContainerInputEdge, isPlayback, hasSelection, selectedNodeIds.length]);
+  }, [handleCopy, handlePaste, handleDeleteSelected, handleCycleContainerOutputEdge, handleCycleContainerInputEdge, isPlayback, hasDeletableSelection, selectedNodeIds.length]);
 
   const handleUpdateSingleNode = (field: keyof ContainerNode, val: any) => {
     if (!singleSelectedNode || isPlayback) return;
@@ -888,9 +1072,9 @@ export default function App() {
             selectedNodeIds={selectedNodeIds}
             selectedLinkIds={selectedLinkIds}
             selectedCorridorIds={selectedCorridorIds}
-            setSelectedNodeIds={setSelectedNodeIds}
-            setSelectedLinkIds={setSelectedLinkIds}
-            setSelectedCorridorIds={setSelectedCorridorIds}
+            setSelectedNodeIds={handleCanvasSelectNodes}
+            setSelectedLinkIds={handleCanvasSelectLinks}
+            setSelectedCorridorIds={handleCanvasSelectCorridors}
             isPlayback={isPlayback}
             highlightedNodeIds={highlightedNodeIds}
             setHighlightedNodeIds={setHighlightedNodeIds}
@@ -912,14 +1096,26 @@ export default function App() {
 
           <PlaybackGraph 
             nodes={nodes}
+            links={links}
+            corridors={corridors}
+            calendar={calendar}
             frames={frames}
             currentDay={currentDay}
+            isPlayback={isPlayback}
             isGraphExpanded={isGraphExpanded}
             setIsGraphExpanded={setIsGraphExpanded}
             setCurrentDay={setCurrentDay}
             vm={vm}
             highlightedNodeIds={highlightedNodeIds}
             setHighlightedNodeIds={setHighlightedNodeIds}
+            selectedCalendarEventId={selectedCalendarEventId}
+            selectedNodeIds={selectedNodeIds}
+            selectedLinkIds={selectedLinkIds}
+            selectedCorridorIds={selectedCorridorIds}
+            onSelectCalendarEvent={handleSelectCalendarEvent}
+            onSelectTargetElement={handleSelectTargetElement}
+            onAddCalendarEvent={handleAddCalendarEvent}
+            onUpdateCalendarEvent={handleUpdateCalendarEvent}
           />
         </div>
 
@@ -934,6 +1130,8 @@ export default function App() {
           singleSelectedNode={singleSelectedNode}
           selectedLink={selectedLink}
           selectedCorridor={selectedCorridor}
+          calendar={calendar}
+          selectedCalendarEvent={selectedCalendarEvent}
           corridors={corridors}
           links={links}
           nodes={nodes}
@@ -948,6 +1146,9 @@ export default function App() {
           onUpdateSingleNode={handleUpdateSingleNode}
           onUpdateLink={handleUpdateLink}
           onUpdateCorridor={handleUpdateCorridor}
+          onUpdateCalendarEvent={handleUpdateCalendarEvent}
+          onDeleteCalendarEvent={handleDeleteCalendarEvent}
+          onSelectTargetElement={handleSelectTargetElement}
           onToggleLinkCorridor={handleToggleLinkCorridor}
           onSetRouteLanes={handleSetRouteLanes}
           onUnlinkLanes={handleUnlinkLanes}
@@ -963,6 +1164,7 @@ export default function App() {
         nodes={nodes}
         links={links}
         corridors={corridors}
+        calendar={calendar}
         frames={frames}
         materials={materials}
       />

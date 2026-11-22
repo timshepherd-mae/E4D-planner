@@ -81,12 +81,39 @@ export const getLinkCorridorIds = (link: { corridorIds?: string[]; corridorId?: 
 
 export type FlowStatus = 'frozen' | 'starved' | 'full' | 'restricted' | 'blocked' | 'idle';
 
+export type CalendarTargetType = 'container' | 'transfer' | 'route';
+export type ContainerEventState = 'open' | 'blocked';
+export type TransferEventState = 'max' | 'variable' | 'stopped';
+export type RouteEventState = 'open' | 'restricted' | 'blocked';
+export type CalendarEventState = ContainerEventState | TransferEventState | RouteEventState;
+
+export interface CalendarEvent {
+  id: string;
+  calendarId: string;
+  targetType: CalendarTargetType;
+  targetId: string;
+  startDay: number;     // 1..totalDays inclusive
+  endDay: number;       // 1..totalDays inclusive (>= startDay)
+  state: CalendarEventState;
+  rateValue?: number;   // m³/d for transfer 'variable' or route 'restricted' combined cap
+  label?: string;
+  notes?: string;
+}
+
+export interface CalendarModel {
+  id: string;
+  name: string;
+  notes?: string;
+  events: CalendarEvent[];
+}
+
 export interface SimFrame {
   day: number;
   nodeVolumes: Record<string, number>;
   linkFlows: Record<string, number>;
   linkStatuses: Record<string, FlowStatus>;
   nodeStatuses: Record<string, FlowStatus>;
+  corridorStatuses?: Record<string, FlowStatus>;
   alerts: string[];
 }
 
