@@ -107,6 +107,25 @@ export const getCalendarEventVisual = (
         semantic: 'red'
       };
     }
+    if (evt.state === 'restricted') {
+      const cap = evt.rateValue ?? 0;
+      if (cap <= 0) {
+        return {
+          bg: 'rgba(239, 68, 68, 0.24)',
+          border: '#ef4444',
+          text: '#fecaca',
+          label: evt.label?.trim() || 'CAP 0',
+          semantic: 'red'
+        };
+      }
+      return {
+        bg: 'rgba(245, 158, 11, 0.24)',
+        border: '#f59e0b',
+        text: '#fde68a',
+        label: evt.label?.trim() || `CAP ${formatCompactRate(cap)}`,
+        semantic: 'amber'
+      };
+    }
     return {
       bg: 'rgba(34, 197, 94, 0.22)',
       border: '#22c55e',
@@ -175,11 +194,21 @@ export const getCalendarEventVisual = (
     };
   }
   if (evt.state === 'restricted') {
+    const cap = evt.rateValue ?? 0;
+    if (cap <= 0) {
+      return {
+        bg: 'rgba(239, 68, 68, 0.24)',
+        border: '#ef4444',
+        text: '#fecaca',
+        label: evt.label?.trim() || 'CAP 0',
+        semantic: 'red'
+      };
+    }
     return {
       bg: 'rgba(245, 158, 11, 0.24)',
       border: '#f59e0b',
       text: '#fde68a',
-      label: evt.label?.trim() || `CAP ${formatCompactRate(evt.rateValue)}`,
+      label: evt.label?.trim() || `CAP ${formatCompactRate(cap)}`,
       semantic: 'amber'
     };
   }
@@ -1179,16 +1208,20 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
             </div>
           </div>
         ) : (
-          corridors.map(corridor =>
-            renderRow(
+          corridors.map(corridor => {
+            const baseLabel =
+              corridor.maxDailyRate !== undefined && Number.isFinite(corridor.maxDailyRate)
+                ? formatCompactRate(corridor.maxDailyRate)
+                : 'OPEN';
+            return renderRow(
               'route',
               corridor.id,
               corridor.name,
-              'OPEN',
+              baseLabel,
               '#a855f7',
               selectedCorridorIds.includes(corridor.id)
-            )
-          )
+            );
+          })
         ))}
     </div>
   );

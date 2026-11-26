@@ -98,7 +98,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       // 2. Container nodes with all properties
       lines.push('# SECTION: INITIAL MODEL NODES');
-      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge,InputEdge');
+      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge,InputEdge,AllowedMaterials');
       const day0Frame = frames[0];
       nodes.forEach(n => {
         const escapedName = `"${(n.name || '').replace(/"/g, '""')}"`;
@@ -112,18 +112,23 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         const escapedNotes = `"${(n.notes || '').replace(/"/g, '""')}"`;
         const outputEdge = n.outputEdge || '';
         const inputEdge = n.inputEdge || '';
-        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge},${inputEdge}`);
+        const allowedMats = n.allowedMaterials && n.allowedMaterials.length > 0
+          ? `"${n.allowedMaterials.join('|').replace(/"/g, '""')}"`
+          : '""';
+        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge},${inputEdge},${allowedMats}`);
       });
       lines.push('');
 
       // 3. Route corridors
       lines.push('# SECTION: CORRIDORS');
-      lines.push('CorridorID,Name,LaneSpacing,WaypointsJSON,Notes');
+      lines.push('CorridorID,Name,LaneSpacing,WaypointsJSON,Notes,MaxDailyRate,MaxFleetCount');
       corridors.forEach(c => {
         const escapedName = `"${(c.name || '').replace(/"/g, '""')}"`;
         const escapedWaypoints = `"${JSON.stringify(c.waypoints || []).replace(/"/g, '""')}"`;
         const escapedNotes = `"${(c.notes || '').replace(/"/g, '""')}"`;
-        lines.push(`${c.id},${escapedName},${c.laneSpacing},${escapedWaypoints},${escapedNotes}`);
+        const maxRate = c.maxDailyRate !== undefined && Number.isFinite(c.maxDailyRate) ? `${c.maxDailyRate}` : '';
+        const maxFleet = c.maxFleetCount !== undefined && Number.isFinite(c.maxFleetCount) ? `${c.maxFleetCount}` : '';
+        lines.push(`${c.id},${escapedName},${c.laneSpacing},${escapedWaypoints},${escapedNotes},${maxRate},${maxFleet}`);
       });
       lines.push('');
 
@@ -212,7 +217,29 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       });
       lines.push('');
 
-      // 6. Unified Diagnostic Summary Table (combining container & transfer records per day)
+      // 5b. Daily Route Corridor Records with combined flows, caps, and simulation status
+      if (corridors.length > 0) {
+        lines.push('# SECTION: SIMULATION DAILY CORRIDOR FLOWS');
+        lines.push('Day,CorridorID,CorridorName,AssignedLinkCount,PlannedCombined_m3d,ActualFlow_m3,BaselineRateCap_m3d,BaselineFleetCap,SimState,Colour,ColourHex,StateDescription');
+        frames.forEach(frame => {
+          corridors.forEach(c => {
+            const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(c.id));
+            const plannedCombined = assignedLinks.reduce((sum, l) => sum + (l.dailyRate || 0), 0);
+            const actualFlow =
+              frame.corridorFlows?.[c.id] ??
+              assignedLinks.reduce((sum, l) => sum + (frame.linkFlows?.[l.id] ?? 0), 0);
+            const corridorStatus: FlowStatus = frame.corridorStatuses?.[c.id] ?? (frame.day === 0 ? 'frozen' : 'idle');
+            const meta = getStatusMeta(corridorStatus, frame.day);
+            const escapedName = `"${(c.name || c.id).replace(/"/g, '""')}"`;
+            const baseCap = c.maxDailyRate !== undefined && Number.isFinite(c.maxDailyRate) ? `${c.maxDailyRate}` : '';
+            const baseFleet = c.maxFleetCount !== undefined && Number.isFinite(c.maxFleetCount) ? `${c.maxFleetCount}` : '';
+            lines.push(`${frame.day},${c.id},${escapedName},${assignedLinks.length},${Math.round(plannedCombined)},${Math.round(actualFlow)},${baseCap},${baseFleet},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+          });
+        });
+        lines.push('');
+      }
+
+      // 6. Unified Diagnostic Summary Table (combining container, transfer & route corridor records per day)
       lines.push('# SECTION: SIMULATION DIAGNOSTIC SUMMARY');
       lines.push('Day,EntityType,EntityID,EntityName,PlannedOrCapacity_m3,ActualVolumeOrFlow_m3,SimState,Colour,ColourHex,StateDescription');
       frames.forEach(frame => {
@@ -236,6 +263,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const linkStatus: FlowStatus = frame.linkStatuses?.[linkId] ?? (frame.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(linkStatus, frame.day);
           lines.push(`${frame.day},Transfer,${linkId},${label},${plannedRate},${Math.round(flow)},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+        });
+
+        // Route Corridors for this day
+        corridors.forEach(c => {
+          const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(c.id));
+          const plannedCombined = assignedLinks.reduce((sum, l) => sum + (l.dailyRate || 0), 0);
+          const actualFlow =
+            frame.corridorFlows?.[c.id] ??
+            assignedLinks.reduce((sum, l) => sum + (frame.linkFlows?.[l.id] ?? 0), 0);
+          const corridorStatus: FlowStatus = frame.corridorStatuses?.[c.id] ?? (frame.day === 0 ? 'frozen' : 'idle');
+          const meta = getStatusMeta(corridorStatus, frame.day);
+          const escapedName = `"${(c.name || c.id).replace(/"/g, '""')}"`;
+          lines.push(`${frame.day},Route,${c.id},${escapedName},${Math.round(plannedCombined)},${Math.round(actualFlow)},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
         });
       });
       lines.push('');
@@ -284,6 +324,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         strictSubRule: n.strictSubRule || 'throttleback',
         headroomThreshold: n.headroomThreshold ?? 500,
         status: n.status || 'active',
+        ...(n.allowedMaterials && n.allowedMaterials.length > 0 ? { allowedMaterials: [...n.allowedMaterials] } : {}),
         outputEdge: n.outputEdge || '',
         inputEdge: n.inputEdge || ''
       }));
@@ -292,6 +333,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         name: c.name,
         laneSpacing: c.laneSpacing,
         waypoints: c.waypoints,
+        ...(c.maxDailyRate !== undefined ? { maxDailyRate: c.maxDailyRate } : {}),
+        ...(c.maxFleetCount !== undefined ? { maxFleetCount: c.maxFleetCount } : {}),
         notes: c.notes || ''
       }));
       payload.links = links.map(l => ({
@@ -368,10 +411,34 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           };
         });
 
+        const dayCorridors = corridors.map(c => {
+          const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(c.id));
+          const plannedCombined = assignedLinks.reduce((sum, l) => sum + (l.dailyRate || 0), 0);
+          const actualFlow =
+            f.corridorFlows?.[c.id] ??
+            assignedLinks.reduce((sum, l) => sum + (f.linkFlows?.[l.id] ?? 0), 0);
+          const corridorStatus: FlowStatus = f.corridorStatuses?.[c.id] ?? (f.day === 0 ? 'frozen' : 'idle');
+          const meta = getStatusMeta(corridorStatus, f.day);
+          return {
+            corridorId: c.id,
+            corridorName: c.name,
+            assignedLinkCount: assignedLinks.length,
+            plannedCombined_m3d: Math.round(plannedCombined),
+            actualFlow_m3: Math.round(actualFlow),
+            ...(c.maxDailyRate !== undefined ? { baselineRateCap_m3d: c.maxDailyRate } : {}),
+            ...(c.maxFleetCount !== undefined ? { baselineFleetCap: c.maxFleetCount } : {}),
+            simState: meta.state,
+            colour: meta.colour,
+            colourHex: meta.hex,
+            stateDescription: meta.label
+          };
+        });
+
         return {
           day: f.day,
           containers: dayContainers,
           transfers: dayTransfers,
+          corridors: dayCorridors,
           alerts: f.alerts || []
         };
       });

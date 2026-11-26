@@ -42,9 +42,8 @@ export interface RouteCorridor {
   waypoints: Point[]; // Minimum 2 points (start, optional bend points, end)
   laneSpacing: number; // Parallel pipe spacing inside corridor in world pixels (default 5)
   notes?: string;
-  // Reserved optional fields for future corridor-level simulation constraints
-  maxDailyRate?: number;
-  maxFleetCount?: number;
+  maxDailyRate?: number;  // Optional baseline combined daily rate cap (m³/d)
+  maxFleetCount?: number; // Optional baseline max combined fleet units
 }
 
 export interface TransferLink {
@@ -82,7 +81,7 @@ export const getLinkCorridorIds = (link: { corridorIds?: string[]; corridorId?: 
 export type FlowStatus = 'frozen' | 'starved' | 'full' | 'restricted' | 'blocked' | 'idle';
 
 export type CalendarTargetType = 'container' | 'transfer' | 'route';
-export type ContainerEventState = 'open' | 'blocked';
+export type ContainerEventState = 'open' | 'restricted' | 'blocked';
 export type TransferEventState = 'max' | 'variable' | 'stopped';
 export type RouteEventState = 'open' | 'restricted' | 'blocked';
 export type CalendarEventState = ContainerEventState | TransferEventState | RouteEventState;
@@ -95,7 +94,7 @@ export interface CalendarEvent {
   startDay: number;     // 1..totalDays inclusive
   endDay: number;       // 1..totalDays inclusive (>= startDay)
   state: CalendarEventState;
-  rateValue?: number;   // m³/d for transfer 'variable' or route 'restricted' combined cap
+  rateValue?: number;   // m³/d for transfer 'variable', container 'restricted', or route 'restricted' cap
   label?: string;
   notes?: string;
 }
@@ -111,6 +110,7 @@ export interface SimFrame {
   day: number;
   nodeVolumes: Record<string, number>;
   linkFlows: Record<string, number>;
+  corridorFlows?: Record<string, number>;
   linkStatuses: Record<string, FlowStatus>;
   nodeStatuses: Record<string, FlowStatus>;
   corridorStatuses?: Record<string, FlowStatus>;

@@ -1,6 +1,6 @@
 # Simulation Engine Ruleset & Consistency Audit
 
-> **Scope:** Current technical specification of the discrete daily simulation engine (`SimEngine`), notification triggers, visual colour coding, and a consistency audit of missing or unwired elements/triggers.
+> **Scope:** Technical specification of the discrete daily simulation engine (`SimEngine`), notification triggers, visual colour coding, and resolution status of all Section 5 consistency amendments.
 
 ---
 
@@ -8,26 +8,31 @@
 
 The simulation runs deterministically as a discrete daily step loop across `day = 0 .. totalDays` (default `totalDays = 30`, numerical epsilon `EPS = 1e-6`).
 
-- **Day 0 (Frozen Baseline):** Captures initial container volumes. All `linkFlows` are `0`, no volumes change, and all containers, transfers, and route corridors are classified as `frozen`.
-- **Days 1..30 (Active Simulation):** Each day executes in five sequential stages:
+- **Day 0 (Frozen Baseline):** Captures initial container volumes (`0` for `null` junctions). All `linkFlows` and `corridorFlows` are `0`, no volumes change, and all containers, transfers, and route corridors are classified as `frozen`.
+- **Days 1..30 (Active Simulation):** Each day executes in six sequential stages:
 
 ```text
-[Stage 0] Resolve Active Calendar Events & Effective Baselines (Containers, Transfers, Routes)
+[Stage 0] Resolve Active Calendar Events, Schedule Override Alerts & Effective Link Rates
     │
     ▼
-[Stage 1] Outbound Source Availability & Pro-Rata Demand Allocation ──► requestedTransfers
+[Stage 1] Outbound Source Availability (Bulking-Aware bulkOUT + Priority Tiers + Container Types)
     │
     ▼
-[Stage 1.5] Route Corridor Calendar Constraints (Blocked & Pro-Rata Combined Cap)
+[Stage 1.25] Container Calendar 'restricted' Throughput Cap (Priority-Tiered Combined Cap)
     │
     ▼
-[Stage 2] Target Container Blocks, Strict Overflow / Headroom Hold, & Throttleback ──► plannedTransfers
+[Stage 1.5] Route Corridor Constraints (Calendar Blocked/Restricted + Baseline maxDailyRate & maxFleetCount)
     │
     ▼
-[Stage 3] Apply Physical Volume Transfers (with Material bulkOUT / bulkIN Factors)
+[Stage 2] Target Capacity & Null-Junction Fixed-Point Convergence
+          (Same-Day Outbound Drainage, Bulking-Aware bulkIN Headroom, Headroom Hold Hysteresis,
+           Priority Tiers, & Zero-Storage Null Pass-Through Balancing) ──► plannedTransfers
     │
     ▼
-[Stage 4] Classify Visual FlowStatus (Links, Containers, Route Corridors) & Emit SimFrame
+[Stage 3] Apply Physical Volume Transfers & Emit Capacity / Overfill Alerts
+    │
+    ▼
+[Stage 4] Classify Visual FlowStatus (Links, Containers, Route Corridors), Record corridorFlows & Emit SimFrame
 ```
 
 ---
@@ -38,71 +43,90 @@ The simulation runs deterministically as a discrete daily step loop across `day 
 
 | Property / Rule | Current Driving Logic |
 | :--- | :--- |
-| **`status`** (`'active' \| 'maintenance' \| 'blocked'`) | If `'blocked'` or `'maintenance'` (and no active Calendar `'open'` override), halts **both** outbound transfers (Stage 1) and inbound transfers (Stage 2). |
-| **Source Stockout** (`currentVolume <= EPS`) | Halts all outbound transfers from that container (`requestedTransfers = 0`). |
-| **Multi-Link Outbound Pro-Rata** | Groups all valid outbound links by `sourceId`. If `source.currentVolume < sum(activeLinkRates)`, scales all outbound links pro-rata by `sourceRatio = min(1, availableVol / totalOutboundRate)`. |
-| **`allowedMaterials`** | If non-empty on a target container, any inbound link whose source container's `materialType` is not listed is rejected (`requestedTransfers = 0`). |
-| **`overflowMode = 'overfill'`** | Uncapped target acceptance. All `requestedTransfers` pass through Stage 2 unthrottled; `target.currentVolume` can exceed `target.capacity`. |
-| **`overflowMode = 'strict'` + `strictSubRule = 'throttleback'`** *(default)* | Computes `headroom = max(0, capacity - currentVolume)`. If `totalRequestedForTarget > headroom`, scales all inbound links pro-rata by `throttleFactor = min(1, headroom / totalRequestedForTarget)`. |
-| **`overflowMode = 'strict'` + `strictSubRule = 'headroom_hold'`** | Stateful hysteresis latch (`headroomHoldStates`, persists across days): latches ON (halted) when `currentVol >= capacity`; stays halted while `headroom < headroomThreshold` (default `500 m³`, all inbound flows = `0`); releases once `headroom >= headroomThreshold`. While unhalted, passes full `req` if `headroom > 0` else `0` (clamped at `capacity` in Stage 3). |
-| **Material Bulking (`bulkOUT` / `bulkIN`)** | Applied in Stage 3 when updating volumes: source removes `transferAmount * bulkOUT` (snaps to `0` if `< EPS`); target adds `transferAmount * bulkIN` (clamped to `capacity` in `strict` mode; uncapped in `overfill` mode). |
+| **`type = 'excavation' \| 'stockpile'`** | Finite-capacity storage container governed by stockout, bulking (`bulkOUT` / `bulkIN`), and overflow rules. |
+| **`type = 'null'`** | Zero-storage pass-through junction (`currentVolume` locked to `0`). Matches same-day inbound supply directly to outbound demand (`totalIn === totalOut`) via fixed-point convergence, back-pressuring upstream when downstream cannot accept flow. |
+| **`type = 'external'`** | Unbounded external boundary. Supplies outbound demand without stockout and absorbs inbound flow without capacity throttling, headroom hold, or overfill blocking (still tracks cumulative volume for graphing). |
+| **`status`** (`'active' \| 'maintenance' \| 'blocked'`) | Editable in Property Inspector. If `'blocked'` or `'maintenance'` (and no active Calendar `'open'` override), halts **both** outbound (Stage 1) and inbound (Stage 2) transfers. |
+| **Source Stockout & Partial Starvation** | If `availableVol <= EPS`, halts outbound links (`starved`). If `0 < availableVol < sum(rate * bulkOUT)`, allocates available volume by link `priority` tier (pro-rata within ties) using `bulkOUT` and emits a low-stock alert. |
+| **`allowedMaterials`** | Editable in Property Inspector & persisted in CSV/JSON. If non-empty on a target container, rejects any inbound link whose effective material (`link.materialId || source.materialType`) is not listed. |
+| **Same-Day Outbound Drainage** | For storage targets, `effectiveHeadroom = max(0, capacity - max(0, startVol - outboundRemoved))` where `outboundRemoved = sum(outboundFlow * bulkOUT)`. A full surge stockpile draining outbound frees equivalent same-day space for inbound deposits. |
+| **`overflowMode = 'overfill'`** | Uncapped target acceptance. All `requestedTransfers` pass through Stage 2 unthrottled; `target.currentVolume` can exceed `target.capacity`, turning both the fill bar and container border Red (`blocked`) and emitting `[OVERFILL]`. |
+| **`overflowMode = 'strict'` + `strictSubRule = 'throttleback'`** *(default)* | Allocates `effectiveHeadroom` across inbound links by `priority` tier (pro-rata within ties) weighted by `bulkIN`, guaranteeing `sum(flow * bulkIN) <= effectiveHeadroom` with zero discarded volume. |
+| **`overflowMode = 'strict'` + `strictSubRule = 'headroom_hold'`** | Stateful hysteresis latch (`headroomHoldStates`): latches ON when `startVol >= capacity - EPS` and `effectiveHeadroom < headroomThreshold`; stays halted (`0` inbound) while `effectiveHeadroom < headroomThreshold`; releases once `effectiveHeadroom >= headroomThreshold - EPS` and emits a resume notification. On the final fill day (unhalted), inbound flow is capped to `effectiveHeadroom` (bulking-aware) so `linkFlows` matches deposited volume. |
+| **Material Bulking (`bulkOUT` / `bulkIN`)** | Looked up via `link.materialId || source.materialType`. Enforced during Stage 1 (`bulkOUT`), Stage 2 (`bulkIN` & same-day `bulkOUT`), and Stage 3 physical volume mutations (skipped for `null` junction storage). |
 
 ### 2.2 Transfer Rules (Baseline)
 
 | Property / Rule | Current Driving Logic |
 | :--- | :--- |
-| **`dailyRate`** | Base daily transfer demand (`m³/d`). If `<= EPS`, the transfer requests `0` flow. |
-| **`rateSchedule`** *(legacy field)* | If defined, selects the rate of the latest entry with `sched.day <= day` before Calendar overrides are evaluated. |
-| **Route Corridor Assignment (`corridorIds`)** | A transfer may reference 0, 1, or multiple Route Corridors. In Stage 1.5, it is subject to every corridor it is assigned to (taking the tightest cap). |
-| **Priority / Fleet (`priority`, `fleetCount`)** | Stored on the link model, **not currently enforced** by `SimEngine`. |
+| **`dailyRate`** | Base daily transfer demand (`m³/d`). If `<= EPS`, the transfer requests `0` flow (`frozen`). |
+| **`priority`** | Editable in Property Inspector (default `1`; lower number = higher precedence). Governs scarcity allocation in Stage 1 (source stock), Stage 1.25 (container cap), Stage 1.5 (route rate cap), and Stage 2 (target headroom & null junction balancing). Links sharing a priority tier split remaining budget pro-rata. |
+| **`materialId`** | Optional material override editable in Property Inspector. Overrides `source.materialType` for `allowedMaterials` validation and `bulkIN`/`bulkOUT` lookup. |
+| **`fleetCount`** | Editable in Property Inspector. Enforced against assigned Route Corridor `maxFleetCount` caps in Stage 1.5. |
+| **`rateSchedule`** *(legacy fallback)* | Evaluated only when no Calendar Transfer event is active on `day`. |
+| **Route Corridor Assignment (`corridorIds`)** | A transfer may reference 0, 1, or multiple Route Corridors. In Stage 1.5, it is subject to every assigned corridor (taking the tightest cap). |
 
-### 2.3 Calendar Event Rules (Days 1..30)
+### 2.3 Route Corridor Rules (Baseline)
 
-An event bar is active on `day` when `day >= 1 && startDay <= day && day <= endDay`. Any day along an element's row with **no** event bar defaults to that element's baseline Property Inspector values.
+| Property / Rule | Current Driving Logic |
+| :--- | :--- |
+| **`maxDailyRate`** | Optional baseline combined daily rate cap (`m³/d`) editable in Property Inspector and exported/imported in CSV/JSON. Enforced on days without an active Route Calendar event (priority-tiered, pro-rata within ties). |
+| **`maxFleetCount`** | Optional baseline combined fleet unit limit editable in Property Inspector and exported/imported in CSV/JSON. If combined `fleetCount` of active assigned transfers exceeds `maxFleetCount`, scales assigned transfers pro-rata by `maxFleetCount / totalFleet`. |
+
+### 2.4 Calendar Event Rules (Days 1..30)
+
+An event bar is active on `day` when `day >= 1 && startDay <= day && day <= endDay`. Any day without an event bar falls back to the element's baseline Property Inspector settings.
 
 #### Container Events (`targetType = 'container'`)
 
 | Event State | Driving Logic |
 | :--- | :--- |
-| **`blocked`** | Overrides baseline status. Halts **both** outbound (Stage 1) and inbound (Stage 2) transfers for that container on active days. |
-| **`open`** | Overrides static `'blocked'` or `'maintenance'` baseline status, allowing normal inbound/outbound operation on active days. |
+| **`open`** | Overrides static `'blocked'` or `'maintenance'` baseline status, allowing normal inbound/outbound operation and emitting an override alert. |
+| **`restricted`** | Caps combined inbound & outbound transfer throughput through the container to `max(0, rateValue)` (`m³/d`), allocated by priority tier (pro-rata within ties). If `rateValue <= EPS`, halts the container (`blocked`). |
+| **`blocked`** | Overrides baseline status. Halts **both** outbound (Stage 1) and inbound (Stage 2) transfers on active days. |
 
 #### Transfer Events (`targetType = 'transfer'`)
 
 | Event State | Driving Logic |
 | :--- | :--- |
-| **`max`** | Sets effective daily rate to `100%` of stated `link.dailyRate` (overriding any `rateSchedule`). |
-| **`variable`** | Sets effective daily rate to `max(0, rateValue)` (`m³/d`). Can either reduce below or boost above stated `dailyRate`. |
-| **`stopped`** | Forces effective daily rate to `0` and marks the link in `calendarStoppedLinks` (forces Red `blocked` status). |
+| **`max`** | Sets effective daily rate to `100%` of stated `link.dailyRate`. |
+| **`variable`** | Sets effective daily rate to `max(0, rateValue)` (`m³/d`), emitting daily reduced/boosted/zero-rate alerts. |
+| **`stopped`** | Forces effective daily rate to `0`, marks the link in `calendarStoppedLinks` (Red `blocked`), and emits a daily stopped alert. |
 
 #### Route Events (`targetType = 'route'`) — Stage 1.5
 
 | Event State | Driving Logic |
 | :--- | :--- |
-| **`open`** | Unrestricted pass-through (same as baseline default). |
-| **`restricted`** | Evaluates `totalCorridorDemand = sum(requestedTransfers)` across all non-blocked links assigned to that corridor. If `rateValue <= EPS`, halts all assigned links (`0`). If `totalCorridorDemand > rateValue`, scales each assigned link **pro-rata** by `ratio = rateValue / totalCorridorDemand`. Links traversing multiple restricted corridors take the tightest (`Math.min`) cap. |
+| **`open`** | Explicitly lifts baseline `maxDailyRate` and `maxFleetCount` caps on active days. |
+| **`restricted`** | Overrides baseline rate cap with `max(0, rateValue)` (`m³/d`) split by priority tier (pro-rata within ties). If `rateValue <= EPS`, halts all assigned links (`0`). |
 | **`blocked`** | Forces `requestedTransfers = 0` for every transfer assigned to that corridor and marks them in `routeBlockedLinks`. |
 
 ---
 
 ## 3. Trigger Notifications (`SimFrame.alerts`)
 
-Alerts are deduplicated per day and only emitted when `day > 0`:
+Alerts are deduplicated per day and emitted for every rule transition or constraint activation:
 
 | Category | Trigger Condition | Exact Alert Message |
 | :--- | :--- | :--- |
-| **Container (Baseline Block)** | Source has `status = 'blocked' \| 'maintenance'` (no `'open'` event) | `Day {d}: Source {name} is blocked or under maintenance.` |
-| **Container (Baseline Block)** | Target has `status = 'blocked' \| 'maintenance'` (no `'open'` event) | `Day {d}: Target {name} is blocked or under maintenance.` |
-| **Container (Calendar Block)** | Source or target has active Calendar `'blocked'` event | `Day {d}: Container {name} is blocked by calendar schedule.` |
-| **Container (Stockout)** | Source has `currentVolume <= EPS` at start of day | `Day {d}: Stockout at source {name}.` |
-| **Material Mismatch** | `target.allowedMaterials` excludes `source.materialType` | `Day {d}: Material mismatch between {src} ({mat}) and target {tgt}.` |
-| **Route (Calendar Blocked)** | Active Route `'blocked'` event (emitted even if 0 links assigned) | `Day {d}: Route {name} is blocked by calendar schedule.` |
-| **Route (Restricted to 0)** | Active Route `'restricted'` event with `rateValue <= EPS` | `Day {d}: Route {name} restricted to 0 m³/d (halted).` |
-| **Route (Restricted Cap)** | Active Route `'restricted'` event and `totalCorridorDemand > cap` | `Day {d}: Route {name} restricted to {cap} m³/d (transfers throttled pro-rata).` |
-| **Headroom Hold** | Target in `strict` + `headroom_hold` and `isHalted === true` | `Day {d}: Target {name} awaiting headroom threshold ({thresh} m³ spare required).` |
-| **Capacity Throttleback** | Target in `strict` + `throttleback` and `totalRequested > headroom` | `Day {d}: Target {name} nearing capacity. Transfer rates throttled pro-rata.` |
-| **Overfill Exceeded** | Post-Stage 3 `node.currentVolume > node.capacity` (`overfill` mode) | `Day {d}: [OVERFILL] Node {name} exceeded capacity by {excess} m³!` |
-| **Strict Capacity Reached** | Post-Stage 3 `node.currentVolume > node.capacity` (`strict` mode) | `Day {d}: Node {name} reached capacity!` *(unreachable — see Section 5)* |
+| **Container (Baseline Block)** | Source or target has `status = 'blocked' \| 'maintenance'` (no `'open'` override) | `Day {d}: Source/Target {name} is blocked or under maintenance.` |
+| **Container (Calendar Block)** | Active Container `'blocked'` event | `Day {d}: Container {name} is blocked by calendar schedule.` |
+| **Container (Calendar Open Override)** | Active Container `'open'` event overrides static `blocked` / `maintenance` | `Day {d}: Container {name} opened by calendar override (static status: {status}).` |
+| **Container (Calendar Restricted)** | Active Container `'restricted'` event caps combined throughput (or `<= 0`) | `Day {d}: Container {name} throughput restricted to {cap} m³/d by calendar schedule.` (or `...restricted to 0 m³/d by calendar schedule (halted).`) |
+| **Container (Stockout)** | Storage source has `startVol <= EPS` with valid outbound demand | `Day {d}: Stockout at source {name}.` |
+| **Container (Partial-Day Starvation)** | Storage source has `0 < availableVol < requiredSourceVol` | `Day {d}: Source {name} low stock ({avail} m³ available vs {req} m³ required). Outbound transfers throttled.` |
+| **Material Mismatch** | `target.allowedMaterials` excludes effective link material | `Day {d}: Material mismatch between {src} ({mat}) and target {tgt}.` |
+| **Transfer (Calendar Stopped)** | Active Transfer `'stopped'` event | `Day {d}: Transfer {src} → {tgt} stopped by calendar schedule.` |
+| **Transfer (Calendar Variable)** | Active Transfer `'variable'` event sets rate to `0`, `< dailyRate`, or `> dailyRate` | `Day {d}: Transfer {src} → {tgt} rate [set to 0 / reduced to {r} / boosted to {r}] m³/d by calendar schedule.` |
+| **Route (Calendar Blocked)** | Active Route `'blocked'` event | `Day {d}: Route {name} is blocked by calendar schedule.` |
+| **Route (Calendar / Baseline Rate Cap)** | Active Route `'restricted'` event or baseline `maxDailyRate` throttles or halts assigned links | `Day {d}: Route {name} restricted to {cap} m³/d (transfers throttled).` / `...baseline rate cap ({cap} m³/d) reached (transfers throttled).` |
+| **Route (Baseline Fleet Cap)** | Combined active `fleetCount > corridor.maxFleetCount` | `Day {d}: Route {name} fleet cap ({max} units vs {total} assigned) reached (transfers throttled).` |
+| **Headroom Hold (Awaiting)** | Target in `strict` + `headroom_hold` and `isHalted === true` | `Day {d}: Target {name} awaiting headroom threshold ({thresh} m³ spare required).` |
+| **Headroom Hold (Resumed)** | Target transitions from `isHalted === true` to `false` | `Day {d}: Target {name} headroom threshold satisfied ({spare} m³ spare). Resuming inbound transfers.` |
+| **Headroom Hold (Final Fill Cap)** | Unhalted `headroom_hold` target caps final fill day to `effectiveHeadroom` | `Day {d}: Target {name} reached capacity on fill day. Final inbound flow capped to available headroom.` |
+| **Capacity Throttleback** | Target in `strict` + `throttleback` and `totalPreTargetDeposit > effectiveHeadroom` | `Day {d}: Target {name} nearing capacity. Transfer rates throttled.` |
+| **Strict Capacity Reached** | Post-Stage 3 `strict` storage node has `vol >= capacity - EPS` (newly reached or full against demand) | `Day {d}: Node {name} reached capacity!` |
+| **Overfill Exceeded** | Post-Stage 3 `overfill` storage node has `vol > capacity + EPS` | `Day {d}: [OVERFILL] Node {name} exceeded capacity by {excess} m³!` |
 
 ---
 
@@ -114,42 +138,47 @@ Alerts are deduplicated per day and only emitted when `day > 0`:
 | :--- | :--- | :--- | :--- |
 | **Blue** | `#38bdf8` | `'frozen'`, `'starved'`, `'idle'` | Day 0 baseline, disconnected/idle element, empty container, or unable to deliver full rate due to lack of material |
 | **Green** | `#22c55e` | `'full'` | Flowing at full expected rate |
-| **Amber** | `#f59e0b` | `'restricted'` | Flowing at reduced/throttled rate (target capacity throttleback, route pro-rata cap, or calendar variable rate below stated rate) |
-| **Red** | `#ef4444` | `'blocked'` | Halted/blocked (capacity/headroom hold, static maintenance/block, material mismatch, or calendar blocked/stopped) |
+| **Amber** | `#f59e0b` | `'restricted'` | Flowing at reduced/throttled rate (target capacity throttleback, container/route cap, partial sibling link block, or reduced calendar variable rate) |
+| **Red** | `#ef4444` | `'blocked'` | Halted/blocked (strict capacity/headroom hold, overfill exceeded, static maintenance/block, material mismatch, or calendar blocked/stopped) |
 
 ### 4.2 Classification Precedence Trees (Day `>= 1`)
 
 #### Transfer Links (`linkStatuses`) — evaluated top-to-bottom
 
 1. Missing source or target → **`frozen`** (Blue)
-2. Transfer calendar `'stopped'` OR Route calendar `'blocked'` (or route cap `<= 0`) → **`blocked`** (Red)
+2. Transfer calendar `'stopped'` OR Route `'blocked'` (or cap `<= 0`) → **`blocked`** (Red)
 3. Transfer calendar `'variable'` with `rateValue <= EPS` → **`blocked`** (Red)
 4. Baseline `linkRate <= EPS` → **`frozen`** (Blue)
-5. Source or target effectively blocked (static or calendar) → **`blocked`** (Red)
-6. `startOfDayVolumes[sourceId] <= EPS` → **`starved`** (Blue)
-7. `actualFlow <= EPS` (target full, headroom hold, or material mismatch) → **`blocked`** (Red)
-8. Throttled by Route `'restricted'` cap OR throttled by target capacity (`actualFlow < postRouteRequested && source.currentVolume > EPS`) → **`restricted`** (Amber)
-9. Transfer calendar `'variable'` with `0 < rateValue < link.dailyRate` and delivering full `rateValue` → **`restricted`** (Amber)
+5. Source or target effectively blocked OR material mismatch → **`blocked`** (Red)
+6. Storage source (`excavation`/`stockpile`) has `startVol <= EPS` → **`starved`** (Blue)
+7. `actualFlow <= EPS` → **`starved`** (Blue) if source is a starved `null` junction, else **`blocked`** (Red)
+8. Throttled by Route cap, Container `'restricted'` cap, or Stage 2 target/null capacity (`actualFlow < preTargetFlow - EPS`) → **`restricted`** (Amber)
+9. Transfer calendar `'variable'` with `0 < rateValue < link.dailyRate` delivering full `rateValue` → **`restricted`** (Amber)
 10. `actualFlow >= effectiveLinkRate - EPS` → **`full`** (Green)
-11. Otherwise (source ran empty mid-day before meeting rate) → **`starved`** (Blue)
+11. Partial-day source starvation → **`starved`** (Blue)
 
 #### Container Nodes (`nodeStatuses`) — evaluated top-to-bottom
 
-1. Effectively blocked (calendar `'blocked'`, or static `'blocked'`/`'maintenance'` without `'open'` override) → **`blocked`** (Red)
-2. No connected links → **`frozen`** (Blue)
-3. `isAtCapacity` (`strict` & `vol >= cap`) OR `isHalted` (`headroom_hold`) OR `(!isEmpty && any connected link is 'blocked')` → **`blocked`** (Red)
-4. `isEmpty` (`vol <= EPS`) → **`starved`** if has outbound links, else **`frozen`** (both Blue)
-5. Any connected link is `'restricted'` → **`restricted`** (Amber)
-6. Any connected link is `'full'` → **`full`** (Green)
-7. Has outbound links → **`starved`** (Blue)
-8. Otherwise → **`frozen`** (Blue)
+1. Effectively blocked (calendar `'blocked'`, calendar `'restricted'` with `0`, or static `'blocked'`/`'maintenance'` without `'open'` override) → **`blocked`** (Red)
+2. `isOverfilled` (`vol > capacity + EPS` on storage node) OR `isAtCapacity` (`strict` storage node `vol >= capacity - EPS`) OR `isHalted` (`headroom_hold`) → **`blocked`** (Red)
+3. No connected links → **`restricted`** (Amber) if active Container `'restricted'` event, else **`frozen`** (Blue)
+4. `hasBlocked && !hasFlowing && !isEmpty` (all active connected flows blocked) → **`blocked`** (Red)
+5. Active Container `'restricted'` event OR `hasRestricted` OR `(hasBlocked && hasFlowing)` (partially blocked while sibling links still flow) → **`restricted`** (Amber)
+6. `type === 'null'` → `full` > `starved` > `blocked` > `frozen`
+7. `isEmpty` (`vol <= EPS` on storage node) → **`starved`** if has outbound links, else **`frozen`** (Blue)
+8. `hasFull` → **`full`** (Green)
+9. `outbound.length > 0 && hasStarved` → **`starved`** (Blue)
+10. `hasBlocked` → **`blocked`** (Red), else **`frozen`** (Blue)
 
 #### Route Corridors (`corridorStatuses`) — evaluated top-to-bottom
 
 1. Route calendar `'blocked'` → **`blocked`** (Red)
-2. Route calendar `'restricted'` → **`blocked`** (Red) if any assigned link is `'blocked'` or `rateValue <= EPS`; otherwise **`restricted`** (Amber)
-3. No assigned links → **`frozen`** (Blue)
-4. Worst-case rollup of assigned `linkStatuses`: `blocked` (Red) > `restricted` (Amber) > `full` (Green) > `starved` (Blue) > `frozen` (Blue)
+2. Route calendar `'restricted'` → **`blocked`** (Red) if `rateValue <= EPS` or all assigned links are `'blocked'`; otherwise **`restricted`** (Amber)
+3. Baseline `maxDailyRate` or `maxFleetCount` actively throttling → **`blocked`** if `maxDailyRate === 0`, else **`restricted`** (Amber)
+4. No assigned links → **`frozen`** (Blue)
+5. All assigned active flows blocked (`hasBlocked && !hasFlowing`) → **`blocked`** (Red)
+6. Any `'restricted'` OR partial block while sibling assigned links flow (`hasBlocked && hasFlowing`) → **`restricted`** (Amber)
+7. `hasFull` → **`full`** (Green) > `hasStarved` → **`starved`** (Blue) > **`frozen`** (Blue)
 
 ### 4.3 Container Fill Bar & Calendar Gantt Bar Colours
 
@@ -157,42 +186,33 @@ Alerts are deduplicated per day and only emitted when `day > 0`:
   - Teal `#0d9488`: `excavation`
   - Amber-brown `#b45309`: `stockpile`
   - Slate `#475569`: `null` / `external`
-  - Red `#ef4444`: overrides fill bar whenever `liveVol > capacity`
+  - Red `#ef4444`: overrides fill bar whenever `liveVol > capacity` on non-`external` storage nodes
 - **Calendar Gantt Bars:**
-  - **Red (`#ef4444`):** Container `blocked`, Transfer `stopped`, Transfer `variable (0)`, Route `blocked`
-  - **Amber (`#f59e0b`):** Route `restricted`, Transfer `variable` where `0 < rateValue < stated dailyRate`
+  - **Red (`#ef4444`):** Container `blocked`, Container `restricted (0)`, Transfer `stopped`, Transfer `variable (0)`, Route `blocked`, Route `restricted (0)`
+  - **Amber (`#f59e0b`):** Container `restricted (>0)`, Route `restricted (>0)`, Transfer `variable` where `0 < rateValue < stated dailyRate`
   - **Green (`#22c55e`):** Container `open`, Route `open`, Transfer `max`, Transfer `variable` where `rateValue >= stated dailyRate`
 
 ---
 
-## 5. Consistency Audit: Missing Elements, Triggers & Engine Gaps
+## 5. Consistency Amendments Checklist (All Implemented)
 
-### 5.1 Missing or Broken Trigger Notifications
+### 5.1 Trigger Notifications
+1. **[DONE] Strict Capacity Alert Fixed:** Detects `vol >= capacity - EPS` for strict storage nodes (newly filled or full against active inbound demand) and emits `Node {name} reached capacity!`.
+2. **[DONE] Transfer Calendar Event Alerts:** Transfer `stopped` and `variable` (zero, reduced, or boosted) emit daily notifications in `SimFrame.alerts`.
+3. **[DONE] Partial-Day Source Starvation Alert:** Emits low-stock alert whenever `0 < availableVol < requiredSourceVol`.
+4. **[DONE] Calendar `open` Override & `headroom_hold` Resume Alerts:** Emits notifications when a Container `open` event overrides static `blocked`/`maintenance`, and when a `headroom_hold` target regains `headroomThreshold` and resumes accepting transfers.
 
-1. **Dead-Code Strict Capacity Alert:** Stage 3 clamps `target.currentVolume = Math.min(target.capacity, ...)`, then Stage 4 checks `if (node.currentVolume > node.capacity)`. As a result, `"Node X reached capacity!"` can **never fire** in `strict` mode (it should detect `>= capacity - EPS` when newly filled or at capacity).
-2. **Transfer Calendar Events Emit Zero Alerts:** Container `blocked` and Route `blocked`/`restricted` emit daily alerts, whereas Transfer `stopped` and Transfer `variable` (reduced or boosted) emit **no** notifications in `frame.alerts`.
-3. **Partial-Day Source Starvation Has No Alert:** Stockout alerts only trigger when a source begins the day at `0` (`<= EPS`), not on the day a source runs dry mid-day (`0 < availableVol < totalOutboundRate`) and throttles outbound links pro-rata.
-4. **Calendar `open` Override & Headroom-Hold Resume Transitions Are Silent:** When a Container `open` event overrides a maintenance/blocked container, or when a `headroom_hold` target regains `headroomThreshold` and resumes accepting transfers, no transition notification is logged.
+### 5.2 Flow & Physics Consistency
+5. **[DONE] Bulking-Aware Allocation & Headroom:** Stage 1 (`bulkOUT`) and Stage 2 (`bulkIN`) account for material bulking factors using `link.materialId || source.materialType`, preventing silent mass loss during strict clamping.
+6. **[DONE] Same-Day Outbound Drainage Frees Target Headroom:** Storage targets compute `effectiveHeadroom = capacity - max(0, startVol - outboundRemoved)` inside the fixed-point Stage 2 solver.
+7. **[DONE] `headroom_hold` Final Fill Day Capped:** Unhalted `headroom_hold` targets cap final fill-day inflows to `effectiveHeadroom` (bulking-aware) so `linkFlows` matches deposited volume.
+8. **[DONE] Single Stopped Sibling Link Does Not Cascade Red to Parent Container:** An open container with both flowing and blocked links now classifies as Amber (`restricted`) rather than Red (`blocked`).
+9. **[DONE] Overfilled Container Border Matches Fill Bar:** Exceeding capacity in `overfill` mode classifies `nodeStatuses` as Red (`blocked`) and displays `"Overfill Exceeded Capacity"` in Playback Telemetry.
 
-### 5.2 Flow & Physics Inconsistencies
-
-5. **Bulking Factors (`bulkIN` / `bulkOUT`) Are Ignored During Allocation & Headroom Checks:**
-   - Stage 1 checks `availableVol / totalOutboundRate` without `bulkOUT`, and Stage 2 checks `headroom / totalRequestedForTarget` without `bulkIN`.
-   - With e.g. `ROCK` (`bulkIN = 1.40`), a strict target with `1,000 m³` headroom accepts `1,000 m³`, multiplies by `1.40` (`1,400 m³`), and silently **discards `400 m³`** via `Math.min(capacity, ...)` while reporting `linkFlows = 1,000`.
-6. **Same-Day Outbound Drainage Does Not Free Target Headroom:**
-   - Stage 2 computes `headroom = capacity - currentVolume` before Stage 3 subtracts same-day outbound transfers. A full surge stockpile draining `1,200 m³/d` cannot simultaneously receive `1,200 m³/d` on the same day in `strict` mode.
-7. **`headroom_hold` Unthrottled Final Fill Day:**
-   - While `headroom > 0` and not yet halted, `headroom_hold` passes full `req` without capping to remaining headroom, causing `linkFlows` on the filling day to over-report vs actual volume deposited.
-8. **Single Stopped Transfer Turns Parent Container Red (`blocked`):**
-   - Container status checks `(!isEmpty && hasBlocked)`. If Container A feeds Links 1 and 2, and Link 2 is `stopped` by a Calendar event while Link 1 flows at 100%, Container A's border turns **Red (`blocked`)** even though the container itself is open and operating.
-9. **Overfilled Container Keeps Green Border:**
-   - In `overfill` mode, exceeding capacity turns the inner fill bar Red and emits an `[OVERFILL]` alert, but `nodeStatuses` stays **Green (`full`)** because `isAtCapacity` excludes `overfill` nodes.
-
-### 5.3 Schema / UI Elements Unused or Asymmetric in `SimEngine`
-
-10. **Container `type` Semantics Not Implemented:** `excavation`, `stockpile`, `null`, and `external` all execute identical storage physics (`null` junctions do not act as zero-storage pass-through nodes; `external` boundaries do not act as unbounded external sources/sinks).
-11. **Baseline Route Limits Missing:** `RouteCorridor` has reserved `maxDailyRate` and `maxFleetCount` fields in the schema, but they are neither editable in the Property Inspector nor enforced as baseline route limits in `SimEngine` (routes currently only throttle via Calendar events).
-12. **Static Container `status` & `allowedMaterials` Missing from Inspector:** `SimEngine` and CSV import/export support Container `status` (`active` / `maintenance` / `blocked`) and `allowedMaterials`, but neither field is exposed in the Property Inspector UI.
-13. **Unused Capacity & Scheduling Fields:** `ContainerNode.plantCount`, `TransferLink.fleetCount`, `TransferLink.priority` (no priority-ordered allocation vs pro-rata), and `TransferLink.materialId` are stored/exported but unused in `SimEngine`. Legacy `TransferLink.rateSchedule` is evaluated in `SimEngine` without any UI, overlapping with Calendar Transfer events.
-14. **Container `restricted` Event Missing:** Routes support `open / restricted / blocked` and Transfers support `max / variable / stopped`, whereas Containers only support `open / blocked` (no container-level throughput cap, e.g., reduced loading plant capacity).
-15. **Corridor Daily Telemetry Missing from Export:** `SimFrame.corridorStatuses` is computed daily for canvas badges and Playback Inspector, but `ExportModal` CSV/JSON daily telemetry tables currently only export Containers and Transfers—not daily Route Corridor combined flows and statuses.
+### 5.3 Schema, UI & Export Symmetry
+10. **[DONE] Container `type` Semantics Implemented:** `null` acts as a zero-storage pass-through junction (`totalIn === totalOut`); `external` acts as an unbounded source/sink.
+11. **[DONE] Baseline Route Limits (`maxDailyRate`, `maxFleetCount`):** Editable in Route Corridor Inspector, shown in Calendar `BASE` column, enforced in Stage 1.5, and persisted in CSV/JSON import/export.
+12. **[DONE] Static Container `status` & `allowedMaterials` Exposed:** Editable in Container Inspector and round-tripped in CSV/JSON export & import.
+13. **[DONE] Priority-Tiered Allocation, Material Override & Fleet Enforcement:** `TransferLink.priority` and `TransferLink.materialId` are editable in Transfer Inspector and enforced across all allocation stages; `fleetCount` is enforced against corridor `maxFleetCount`; legacy `rateSchedule` acts strictly as fallback when no Calendar Transfer event is active.
+14. **[DONE] Container Calendar `'restricted'` Event State:** Added `'restricted'` throughput cap (`rateValue` m³/d) across `types.ts`, `SimEngine.ts`, `CalendarGantt.tsx`, `PropertyInspector.tsx`, and CSV/JSON import/export.
+15. **[DONE] Corridor Daily Telemetry in Exports:** `SimFrame.corridorFlows` and `corridorStatuses` are exported in `SIMULATION DAILY CORRIDOR FLOWS`, `SIMULATION DIAGNOSTIC SUMMARY` (`Route` rows), and JSON `dailyFrames[].corridors`.

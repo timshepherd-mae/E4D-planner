@@ -432,6 +432,7 @@ export default function App() {
         const parsedCalendarEvents: CalendarEvent[] = [];
         let currentSection = '';
         let nodeHeaderCols: string[] = [];
+        let corridorHeaderCols: string[] = [];
         let linkHeaderCols: string[] = [];
 
         for (const line of lines) {
@@ -446,6 +447,7 @@ export default function App() {
             continue;
           } else if (trimmed.startsWith('# SECTION: CORRIDORS')) {
             currentSection = 'CORRIDORS';
+            corridorHeaderCols = [];
             continue;
           } else if (trimmed.startsWith('# SECTION: INITIAL MODEL LINKS') || trimmed.startsWith('# SECTION: LINKS')) {
             currentSection = 'LINKS';
@@ -468,12 +470,15 @@ export default function App() {
             nodeHeaderCols = trimmed.split(',').map(c => c.trim().toLowerCase().replace(/^"|"$/g, ''));
             continue; // Header row
           }
+          if (trimmed.toLowerCase().startsWith('corridorid,')) {
+            corridorHeaderCols = trimmed.split(',').map(c => c.trim().toLowerCase().replace(/^"|"$/g, ''));
+            continue; // Header row
+          }
           if (trimmed.toLowerCase().startsWith('linkid,')) {
             linkHeaderCols = trimmed.split(',').map(c => c.trim().toLowerCase().replace(/^"|"$/g, ''));
             continue; // Header row
           }
           if (
-            trimmed.toLowerCase().startsWith('corridorid,') ||
             trimmed.toLowerCase().startsWith('calendarid,') ||
             trimmed.toLowerCase().startsWith('eventid,') ||
             trimmed.toLowerCase().startsWith('code,') ||
@@ -541,6 +546,17 @@ export default function App() {
                 ? (rawInputEdge as CardinalEdge)
                 : undefined;
 
+              const allowedMatsIdx = nodeHeaderCols.indexOf('allowedmaterials');
+              let allowedMaterials: string[] | undefined = undefined;
+              if (allowedMatsIdx !== -1 && parts[allowedMatsIdx] !== undefined) {
+                const rawAllowed = parts[allowedMatsIdx].replace(/^"|"$/g, '').trim();
+                const codes = rawAllowed
+                  .split('|')
+                  .map(s => s.trim().toUpperCase())
+                  .filter(Boolean);
+                if (codes.length > 0) allowedMaterials = Array.from(new Set(codes));
+              }
+
               parsedNodes.push({
                 id: parts[0].trim(),
                 name: parts[1].replace(/^"|"$/g, '').trim(),
@@ -555,13 +571,14 @@ export default function App() {
                 strictSubRule,
                 headroomThreshold: isNaN(headroomThreshold) ? 500 : headroomThreshold,
                 status,
+                ...(allowedMaterials ? { allowedMaterials } : {}),
                 ...(outputEdge ? { outputEdge } : {}),
                 ...(inputEdge ? { inputEdge } : {}),
                 notes: notes || undefined
               });
             }
           } else if (currentSection === 'CORRIDORS') {
-            // Format: CorridorID,Name,LaneSpacing,WaypointsJSON,Notes
+            // Format: CorridorID,Name,LaneSpacing,WaypointsJSON,Notes,[MaxDailyRate],[MaxFleetCount]
             const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
             if (parts.length >= 4) {
               const id = parts[0].replace(/^"|"$/g, '').trim();
@@ -569,6 +586,15 @@ export default function App() {
               const laneSpacing = parseFloat(parts[2]) || 5;
               const rawWaypoints = parts[3].replace(/^"|"$/g, '').replace(/""/g, '"').trim();
               const notes = parts[4] ? parts[4].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : undefined;
+
+              const maxRateIdx = corridorHeaderCols.indexOf('maxdailyrate');
+              const rawMaxRate = (maxRateIdx !== -1 ? parts[maxRateIdx] : parts[5])?.replace(/^"|"$/g, '').trim() ?? '';
+              const maxDailyRate = rawMaxRate !== '' && !isNaN(parseFloat(rawMaxRate)) ? Math.max(0, parseFloat(rawMaxRate)) : undefined;
+
+              const maxFleetIdx = corridorHeaderCols.indexOf('maxfleetcount');
+              const rawMaxFleet = (maxFleetIdx !== -1 ? parts[maxFleetIdx] : parts[6])?.replace(/^"|"$/g, '').trim() ?? '';
+              const maxFleetCount = rawMaxFleet !== '' && !isNaN(parseInt(rawMaxFleet, 10)) ? Math.max(1, parseInt(rawMaxFleet, 10)) : undefined;
+
               try {
                 const parsedPts = JSON.parse(rawWaypoints);
                 if (
@@ -582,6 +608,8 @@ export default function App() {
                     name,
                     laneSpacing,
                     waypoints: parsedPts.map((p: any) => ({ x: p.x, y: p.y })),
+                    ...(maxDailyRate !== undefined ? { maxDailyRate } : {}),
+                    ...(maxFleetCount !== undefined ? { maxFleetCount } : {}),
                     notes: notes || undefined
                   });
                 }
@@ -659,7 +687,7 @@ export default function App() {
 
               const validTargetTypes: CalendarTargetType[] = ['container', 'transfer', 'route'];
               const validStatesByType: Record<CalendarTargetType, CalendarEventState[]> = {
-                container: ['open', 'blocked'],
+                container: ['open', 'restricted', 'blocked'],
                 transfer: ['max', 'variable', 'stopped'],
                 route: ['open', 'restricted', 'blocked']
               };
@@ -887,7 +915,7 @@ export default function App() {
         strictSubRule: clipboard.properties.strictSubRule,
         headroomThreshold: clipboard.properties.headroomThreshold,
         status: clipboard.properties.status,
-        ...(clipboard.properties.allowedMaterials ? { allowedMaterials: [...clipboard.properties.allowedMaterials] } : {}),
+        allowedMaterials: clipboard.properties.allowedMaterials ? [...clipboard.properties.allowedMaterials] : undefined,
         notes: clipboard.properties.notes
       };
 

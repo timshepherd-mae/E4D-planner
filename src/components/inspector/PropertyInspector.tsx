@@ -123,10 +123,14 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
     const corridor = corridors.find(c => c.id === evt.targetId);
     const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(evt.targetId));
     const combinedRate = assignedLinks.reduce((sum, l) => sum + (l.dailyRate || 0), 0);
+    const baseCapNote =
+      corridor?.maxDailyRate !== undefined && Number.isFinite(corridor.maxDailyRate)
+        ? ` · Base cap ${Math.round(corridor.maxDailyRate).toLocaleString()} m³/d`
+        : '';
     return {
       typeLabel: 'Route Corridor',
       name: corridor?.name || evt.targetId,
-      baseSummary: `${assignedLinks.length} transfer${assignedLinks.length === 1 ? '' : 's'} · ${Math.round(combinedRate).toLocaleString()} m³/d combined`
+      baseSummary: `${assignedLinks.length} transfer${assignedLinks.length === 1 ? '' : 's'} · ${Math.round(combinedRate).toLocaleString()} m³/d combined${baseCapNote}`
     };
   };
 
@@ -405,16 +409,29 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             const liveVol = currentFrame ? (currentFrame.nodeVolumes[singleSelectedNode.id] ?? singleSelectedNode.currentVolume) : singleSelectedNode.currentVolume;
             const nodeStatus = currentFrame?.nodeStatuses?.[singleSelectedNode.id] ?? 'frozen';
             const activeCalEvt = getActiveCalendarEventForTarget('container', singleSelectedNode.id);
+            const isOverfilled =
+              singleSelectedNode.type !== 'external' &&
+              singleSelectedNode.type !== 'null' &&
+              liveVol > singleSelectedNode.capacity + 1e-6;
+            const blockedLabel = isOverfilled
+              ? 'Overfill Exceeded Capacity'
+              : activeCalEvt?.state === 'blocked' || (activeCalEvt?.state === 'restricted' && (activeCalEvt.rateValue ?? 0) <= 0)
+              ? 'Blocked (Calendar Event)'
+              : singleSelectedNode.status === 'blocked' || singleSelectedNode.status === 'maintenance'
+              ? `Blocked (${singleSelectedNode.status === 'maintenance' ? 'Maintenance' : 'Static Status'})`
+              : 'Blocked (Capacity Constraint)';
             const statusConfig = {
               full: { label: 'Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
-              restricted: { label: 'Flowing at Restricted Rate', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
-              blocked: { label: activeCalEvt?.state === 'blocked' ? 'Blocked (Calendar Event)' : 'Blocked (Capacity Constraint)', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
+              restricted: { label: activeCalEvt?.state === 'restricted' ? 'Restricted (Calendar Throughput Cap)' : 'Flowing at Restricted Rate', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
+              blocked: { label: blockedLabel, color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
               starved: { label: 'Cannot Deliver (Lack of Material)', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Inactive / Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
             }[nodeStatus] || { label: 'Frozen', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' };
 
-            const fillPct = Math.min(100, Math.round((liveVol / singleSelectedNode.capacity) * 100));
+            const fillPct = singleSelectedNode.capacity > 0
+              ? Math.round((liveVol / singleSelectedNode.capacity) * 100)
+              : 0;
 
             return (
               <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -428,17 +445,26 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
 
                 {activeCalEvt && (
                   <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
-                    Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong> (D{activeCalEvt.startDay}–D{activeCalEvt.endDay})
+                    Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong>
+                    {activeCalEvt.state === 'restricted' ? ` (Cap ${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d)` : ''} (D{activeCalEvt.startDay}–D{activeCalEvt.endDay})
                   </div>
                 )}
 
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
-                  <span>Live Volume:</span>
-                  <span style={{ fontWeight: 600 }}>{Math.round(liveVol).toLocaleString()} / {Math.round(singleSelectedNode.capacity).toLocaleString()} m³ ({fillPct}%)</span>
+                  <span>{singleSelectedNode.type === 'null' ? 'Pass-Through Storage:' : singleSelectedNode.type === 'external' ? 'Cumulative Volume:' : 'Live Volume:'}</span>
+                  <span style={{ fontWeight: 600 }}>
+                    {singleSelectedNode.type === 'null'
+                      ? '0 m³ (Null Junction)'
+                      : singleSelectedNode.type === 'external'
+                      ? `${Math.round(liveVol).toLocaleString()} m³ (Unbounded)`
+                      : `${Math.round(liveVol).toLocaleString()} / ${Math.round(singleSelectedNode.capacity).toLocaleString()} m³ (${fillPct}%)`}
+                  </span>
                 </div>
-                <div style={{ width: '100%', height: '8px', backgroundColor: '#334155', borderRadius: '4px', overflow: 'hidden' }}>
-                  <div style={{ width: `${Math.min(100, fillPct)}%`, height: '100%', backgroundColor: liveVol > singleSelectedNode.capacity ? '#ef4444' : (singleSelectedNode.type === 'excavation' ? '#0d9488' : singleSelectedNode.type === 'stockpile' ? '#b45309' : '#475569') }} />
-                </div>
+                {singleSelectedNode.type !== 'null' && (
+                  <div style={{ width: '100%', height: '8px', backgroundColor: '#334155', borderRadius: '4px', overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(100, Math.max(0, fillPct))}%`, height: '100%', backgroundColor: isOverfilled ? '#ef4444' : (singleSelectedNode.type === 'excavation' ? '#0d9488' : singleSelectedNode.type === 'stockpile' ? '#b45309' : '#475569') }} />
+                  </div>
+                )}
                 {singleSelectedNode.notes && (
                   <div style={{ marginTop: '2px', padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
                     <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>NOTES</div>
@@ -500,7 +526,9 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           {/* Selected Route Corridor Live Telemetry */}
           {selectedCorridor && (() => {
             const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(selectedCorridor.id));
-            const combinedLiveFlow = assignedLinks.reduce((sum, l) => sum + (currentFrame?.linkFlows?.[l.id] ?? 0), 0);
+            const combinedLiveFlow =
+              currentFrame?.corridorFlows?.[selectedCorridor.id] ??
+              assignedLinks.reduce((sum, l) => sum + (currentFrame?.linkFlows?.[l.id] ?? 0), 0);
             const combinedPlanned = assignedLinks.reduce((sum, l) => sum + l.dailyRate, 0);
             const corridorStatus = currentFrame?.corridorStatuses?.[selectedCorridor.id] ?? 'frozen';
             const activeCalEvt = getActiveCalendarEventForTarget('route', selectedCorridor.id);
@@ -525,7 +553,16 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                 {activeCalEvt && (
                   <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
                     Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong>
-                    {activeCalEvt.state === 'restricted' ? ` (Cap ${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d pro-rata)` : ''} · D{activeCalEvt.startDay}–D{activeCalEvt.endDay}
+                    {activeCalEvt.state === 'restricted' ? ` (Cap ${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d)` : ''} · D{activeCalEvt.startDay}–D{activeCalEvt.endDay}
+                  </div>
+                )}
+                {(selectedCorridor.maxDailyRate !== undefined || selectedCorridor.maxFleetCount !== undefined) && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
+                    <span>Baseline Limits:</span>
+                    <span>
+                      {selectedCorridor.maxDailyRate !== undefined ? `${Math.round(selectedCorridor.maxDailyRate).toLocaleString()} m³/d` : 'No rate cap'}
+                      {selectedCorridor.maxFleetCount !== undefined ? ` · ${selectedCorridor.maxFleetCount} fleet` : ''}
+                    </span>
                   </div>
                 )}
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
@@ -587,9 +624,17 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               if (nextState === 'variable' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
                 updates.rateValue = targetLink ? Math.round((targetLink.dailyRate * 0.5) / 50) * 50 : 500;
               } else if (nextState === 'restricted' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
-                const assigned = links.filter(l => getLinkCorridorIds(l).includes(selectedCalendarEvent.targetId));
-                const combined = assigned.reduce((s, l) => s + l.dailyRate, 0);
-                updates.rateValue = combined > 0 ? Math.max(50, Math.round((combined * 0.5) / 50) * 50) : 1000;
+                if (selectedCalendarEvent.targetType === 'container') {
+                  const connected = links.filter(
+                    l => l.sourceId === selectedCalendarEvent.targetId || l.targetId === selectedCalendarEvent.targetId
+                  );
+                  const combined = connected.reduce((s, l) => s + l.dailyRate, 0);
+                  updates.rateValue = combined > 0 ? Math.max(50, Math.round((combined * 0.5) / 50) * 50) : 1000;
+                } else {
+                  const assigned = links.filter(l => getLinkCorridorIds(l).includes(selectedCalendarEvent.targetId));
+                  const combined = assigned.reduce((s, l) => s + l.dailyRate, 0);
+                  updates.rateValue = combined > 0 ? Math.max(50, Math.round((combined * 0.5) / 50) * 50) : 1000;
+                }
               }
               onUpdateCalendarEvent(selectedCalendarEvent.id, updates);
             };
@@ -687,6 +732,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     {selectedCalendarEvent.targetType === 'container' && (
                       <>
                         <option value="open">Open (Normal Inbound & Outbound)</option>
+                        <option value="restricted">Restricted (Combined Throughput Cap)</option>
                         <option value="blocked">Blocked (Halt Inbound & Outbound)</option>
                       </>
                     )}
@@ -709,11 +755,14 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
 
                 {/* Conditional Rate Value input */}
                 {((selectedCalendarEvent.targetType === 'transfer' && selectedCalendarEvent.state === 'variable') ||
+                  (selectedCalendarEvent.targetType === 'container' && selectedCalendarEvent.state === 'restricted') ||
                   (selectedCalendarEvent.targetType === 'route' && selectedCalendarEvent.state === 'restricted')) && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                     <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>
                       {selectedCalendarEvent.targetType === 'route'
                         ? 'Combined Route Daily Cap (m³/day)'
+                        : selectedCalendarEvent.targetType === 'container'
+                        ? 'Container Throughput Cap (m³/day)'
                         : 'Override Transfer Rate (m³/day)'}
                     </label>
                     <input
@@ -726,7 +775,9 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     />
                     <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.4 }}>
                       {selectedCalendarEvent.targetType === 'route'
-                        ? 'Splits this combined daily rate cap pro-rata across all active transfers assigned to this route.'
+                        ? 'Splits this combined daily rate cap by priority (pro-rata within ties) across all active transfers assigned to this route.'
+                        : selectedCalendarEvent.targetType === 'container'
+                        ? 'Caps combined inbound & outbound transfer throughput through this container by priority (pro-rata within ties).'
                         : targetLink
                         ? `Overrides stated rate of ${Math.round(targetLink.dailyRate).toLocaleString()} m³/d during Day ${selectedCalendarEvent.startDay}–${selectedCalendarEvent.endDay}.`
                         : 'Overrides daily transfer rate during this window.'}
@@ -807,8 +858,30 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                 <select value={singleSelectedNode.type} onChange={e => onUpdateSingleNode('type', e.target.value as any)} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}>
                   <option value="excavation">Excavation (Cut)</option>
                   <option value="stockpile">Stockpile (Fill)</option>
-                  <option value="null">Null Junction</option>
-                  <option value="external">External Boundary</option>
+                  <option value="null">Null Junction (Pass-Through)</option>
+                  <option value="external">External Boundary (Unbounded)</option>
+                </select>
+                {singleSelectedNode.type === 'null' && (
+                  <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.35 }}>
+                    Zero-storage junction: matches daily inbound supply directly to outbound transfers without buffering.
+                  </div>
+                )}
+                {singleSelectedNode.type === 'external' && (
+                  <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.35 }}>
+                    Unbounded boundary: supplies outbound flow without stockout and absorbs inbound flow without capacity blocking.
+                  </div>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Operational Status (Baseline)</label>
+                <select
+                  value={singleSelectedNode.status || 'active'}
+                  onChange={e => onUpdateSingleNode('status', e.target.value as any)}
+                  style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
+                >
+                  <option value="active">Active (Open)</option>
+                  <option value="maintenance">Maintenance (Halted)</option>
+                  <option value="blocked">Blocked (Halted)</option>
                 </select>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -833,6 +906,54 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Allowed Inbound Materials</label>
+                  <span style={{ fontSize: '10px', color: '#64748b' }}>
+                    {singleSelectedNode.allowedMaterials && singleSelectedNode.allowedMaterials.length > 0
+                      ? `${singleSelectedNode.allowedMaterials.length} selected`
+                      : 'All allowed'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', backgroundColor: '#0f172a', padding: '8px', borderRadius: '4px', border: '1px solid #334155' }}>
+                  {materials.map(mat => {
+                    const currentAllowed = singleSelectedNode.allowedMaterials || [];
+                    const isChecked = currentAllowed.includes(mat.code);
+                    return (
+                      <label
+                        key={mat.code}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '5px',
+                          padding: '3px 7px',
+                          borderRadius: '4px',
+                          backgroundColor: isChecked ? 'rgba(56, 189, 248, 0.14)' : '#1e293b',
+                          border: isChecked ? '1px solid rgba(56, 189, 248, 0.45)' : '1px solid #334155',
+                          color: isChecked ? '#e0f2fe' : '#94a3b8',
+                          fontSize: '10px',
+                          fontWeight: 600,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={e => {
+                            const next = e.target.checked
+                              ? Array.from(new Set([...currentAllowed, mat.code]))
+                              : currentAllowed.filter(c => c !== mat.code);
+                            onUpdateSingleNode('allowedMaterials', next.length > 0 ? next : undefined);
+                          }}
+                          style={{ accentColor: '#38bdf8', margin: 0 }}
+                        />
+                        <span>{mat.code}</span>
+                      </label>
+                    );
+                  })}
+                </div>
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -968,11 +1089,32 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Daily Rate (m³/day)</label>
-                <input type="number" value={selectedLink.dailyRate} onChange={e => onUpdateLink('dailyRate', Number(e.target.value))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }} />
+                <input type="number" value={selectedLink.dailyRate} onChange={e => onUpdateLink('dailyRate', Number(e.target.value))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Fleet Count</label>
+                  <input type="number" min={0} value={selectedLink.fleetCount} onChange={e => onUpdateLink('fleetCount', Math.max(0, Number(e.target.value) || 0))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Priority (1 = High)</label>
+                  <input type="number" min={1} max={99} value={selectedLink.priority ?? 1} onChange={e => onUpdateLink('priority', Math.max(1, Math.round(Number(e.target.value) || 1)))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
+                </div>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Fleet Count</label>
-                <input type="number" value={selectedLink.fleetCount} onChange={e => onUpdateLink('fleetCount', Number(e.target.value))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }} />
+                <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Material Override</label>
+                <select
+                  value={selectedLink.materialId || ''}
+                  onChange={e => onUpdateLink('materialId', e.target.value || undefined)}
+                  style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
+                >
+                  <option value="">Default (Inherit Source Material)</option>
+                  {materials.map(mat => (
+                    <option key={mat.code} value={mat.code}>
+                      {mat.code} — {mat.name} (IN: {mat.bulkIN}, OUT: {mat.bulkOUT})
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {(() => {
@@ -1105,6 +1247,45 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   onChange={e => onUpdateCorridor('laneSpacing', Math.max(3, Math.min(24, Number(e.target.value) || 5)))}
                   style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }}
                 />
+              </div>
+
+              <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 'bold', color: '#38bdf8' }}>Baseline Route Limits</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Max Rate (m³/d)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step={50}
+                      placeholder="Unlimited"
+                      value={selectedCorridor.maxDailyRate ?? ''}
+                      onChange={e => {
+                        const raw = e.target.value.trim();
+                        onUpdateCorridor('maxDailyRate', raw === '' ? undefined : Math.max(0, Number(raw) || 0));
+                      }}
+                      style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '7px', fontSize: '11px', fontVariantNumeric: 'tabular-nums' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Max Fleet Units</label>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      placeholder="Unlimited"
+                      value={selectedCorridor.maxFleetCount ?? ''}
+                      onChange={e => {
+                        const raw = e.target.value.trim();
+                        onUpdateCorridor('maxFleetCount', raw === '' ? undefined : Math.max(1, Math.round(Number(raw) || 1)));
+                      }}
+                      style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '7px', fontSize: '11px', fontVariantNumeric: 'tabular-nums' }}
+                    />
+                  </div>
+                </div>
+                <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.4 }}>
+                  Applied on days without a Route Calendar override. Calendar <strong>Open</strong> lifts baseline limits; <strong>Restricted</strong> overrides the rate cap.
+                </div>
               </div>
 
               <div style={{ backgroundColor: '#0f172a', padding: '10px 12px', borderRadius: '6px', border: '1px solid #334155', fontSize: '11px', color: '#94a3b8', lineHeight: 1.45 }}>
