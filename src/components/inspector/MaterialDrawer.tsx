@@ -13,10 +13,9 @@ export const MaterialDrawer: React.FC<MaterialDrawerProps> = ({ vm, materials, o
 
   return (
     <div style={{
-      position: 'absolute',
-      bottom: 0,
-      left: 0,
-      right: 0,
+      position: 'relative',
+      flexShrink: 0,
+      width: '100%',
       backgroundColor: '#0f172a',
       borderTop: '2px solid #38bdf8',
       borderTopLeftRadius: '12px',
@@ -24,7 +23,6 @@ export const MaterialDrawer: React.FC<MaterialDrawerProps> = ({ vm, materials, o
       boxShadow: '0 -8px 20px rgba(0,0,0,0.5)',
       display: 'flex',
       flexDirection: 'column',
-      transition: 'all 0.3s ease',
       zIndex: 50,
       boxSizing: 'border-box'
     }}>

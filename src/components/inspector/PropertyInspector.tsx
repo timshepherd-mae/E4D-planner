@@ -200,7 +200,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
     : `Paste copied ${clipboard.type === 'container' ? 'container' : 'transfer link'} properties into selected element(s) (Ctrl+V)`;
 
   return (
-    <div style={{ flex: 1, backgroundColor: '#1e293b', borderLeft: '1px solid #334155', display: 'flex', flexDirection: 'column', color: '#f8fafc', padding: '20px', boxSizing: 'border-box', overflowY: 'auto', minWidth: '320px', height: '100%', position: 'relative' }}>
+    <div style={{ flex: 1, backgroundColor: '#1e293b', borderLeft: '1px solid #334155', display: 'flex', flexDirection: 'column', color: '#f8fafc', boxSizing: 'border-box', overflow: 'hidden', minWidth: '320px', height: '100%', minHeight: 0, position: 'relative' }}>
       
       {/* Header with Title and Copy/Paste Actions */}
       <div style={{
@@ -208,10 +208,11 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
         alignItems: 'center',
         justifyContent: 'space-between',
         gap: '8px',
-        marginBottom: '16px',
+        padding: '20px 20px 12px 20px',
         borderBottom: '1px solid #334155',
-        paddingBottom: '12px',
-        minHeight: '36px'
+        minHeight: '36px',
+        flexShrink: 0,
+        boxSizing: 'border-box'
       }}>
         <div style={{
           fontSize: '13px',
@@ -363,6 +364,8 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
         )}
       </div>
 
+      {/* Scrollable Inspector Body (stays strictly above the anchored MaterialDrawer) */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '16px 20px 20px 20px', boxSizing: 'border-box' }}>
       {isPlayback ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
           <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155' }}>
@@ -723,7 +726,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             const durationDays = selectedCalendarEvent.endDay - selectedCalendarEvent.startDay + 1;
 
             return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '120px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px', border: '1px solid #334155' }}>
                   <span>
                     Selected: <strong style={{ color: '#38bdf8' }}>Calendar Event</strong>
@@ -926,7 +929,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           })()}
 
           {isPureNode && selectedNodeIds.length === 1 && singleSelectedNode && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '150px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
               <div style={{ fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px' }}>
                 Selected: <strong style={{ color: '#38bdf8' }}>Container Node</strong>
               </div>
@@ -1307,7 +1310,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             ];
 
             return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '140px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px' }}>
                   <span>Selected: <strong style={{ color: '#38bdf8' }}>Transfer Link</strong></span>
                   {currentRole !== 'primary' && (
@@ -1721,7 +1724,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           })()}
 
           {isPureSingleCorridor && selectedCorridor && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '120px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
               <div style={{ fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px' }}>
                 Selected: <strong style={{ color: '#38bdf8' }}>Route Corridor</strong>
               </div>
@@ -1888,7 +1891,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               ).length;
 
               return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', paddingBottom: '120px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                   <div style={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: '8px', borderBottom: '1px solid #1e293b' }}>
                       <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.6px', textTransform: 'uppercase', color: '#38bdf8' }}>
@@ -2025,6 +2028,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             )}
         </>
       )}
+      </div>
 
       {!isPlayback && (
         <MaterialDrawer vm={vm} materials={materials} onMaterialsUpdated={onMaterialsUpdated} />
