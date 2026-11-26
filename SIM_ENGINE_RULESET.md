@@ -15,24 +15,30 @@ The simulation runs deterministically as a discrete daily step loop across `day 
 [Stage 0] Resolve Active Calendar Events, Schedule Override Alerts & Effective Link Rates
     │
     ▼
-[Stage 1] Outbound Source Availability (Bulking-Aware bulkOUT + Priority Tiers + Container Types)
+[Stage 1] Outbound Source Availability (Primary Links: Bulking-Aware bulkOUT + Priority Tiers)
     │
     ▼
 [Stage 1.25] Container Calendar 'restricted' Throughput Cap (Priority-Tiered Combined Cap)
     │
     ▼
-[Stage 1.5] Route Corridor Constraints (Calendar Blocked/Restricted + Baseline maxDailyRate & maxFleetCount)
+[Stage 1.5A] Primary Route Corridor Constraints (Calendar Blocked/Restricted + Baseline Caps)
     │
     ▼
-[Stage 2] Target Capacity & Null-Junction Fixed-Point Convergence
-          (Same-Day Outbound Drainage, Bulking-Aware bulkIN Headroom, Headroom Hold Hysteresis,
-           Priority Tiers, & Zero-Storage Null Pass-Through Balancing) ──► plannedTransfers
+[Stage 1.5B] Backup Route Corridor Spillover (Unmet Primary Route Remainder → backupCorridorIds)
     │
     ▼
-[Stage 3] Apply Physical Volume Transfers & Emit Capacity / Overfill Alerts
+[Stage 2A] Container Backup ("Transfer-Through") & Target Capacity / Null-Junction Fixed-Point Solver
+           (Configurable overflowTriggerPct, Explicit 'overflow' Links, Multi-Hop Chaining,
+            Backup Saturation Fallback to Throttleback, Same-Day Drainage, Headroom Hold)
     │
     ▼
-[Stage 4] Classify Visual FlowStatus (Links, Containers, Route Corridors), Record corridorFlows & Emit SimFrame
+[Stage 2B] Standby Transfer Link Activation (Priority-Ordered Spillover Remainder per primaryLinkId)
+    │
+    ▼
+[Stage 3] Apply Simultaneous Order-Independent Physical Volume Transfers & Overfill/Capacity Alerts
+    │
+    ▼
+[Stage 4] Reconcile Route Splits, Populate corridorFlows/backupCorridorFlows, Classify FlowStatus & Emit SimFrame
 ```
 
 ---
@@ -53,18 +59,22 @@ The simulation runs deterministically as a discrete daily step loop across `day 
 | **`overflowMode = 'overfill'`** | Uncapped target acceptance. All `requestedTransfers` pass through Stage 2 unthrottled; `target.currentVolume` can exceed `target.capacity`, turning both the fill bar and container border Red (`blocked`) and emitting `[OVERFILL]`. |
 | **`overflowMode = 'strict'` + `strictSubRule = 'throttleback'`** *(default)* | Allocates `effectiveHeadroom` across inbound links by `priority` tier (pro-rata within ties) weighted by `bulkIN`, guaranteeing `sum(flow * bulkIN) <= effectiveHeadroom` with zero discarded volume. |
 | **`overflowMode = 'strict'` + `strictSubRule = 'headroom_hold'`** | Stateful hysteresis latch (`headroomHoldStates`): latches ON when `startVol >= capacity - EPS` and `effectiveHeadroom < headroomThreshold`; stays halted (`0` inbound) while `effectiveHeadroom < headroomThreshold`; releases once `effectiveHeadroom >= headroomThreshold - EPS` and emits a resume notification. On the final fill day (unhalted), inbound flow is capped to `effectiveHeadroom` (bulking-aware) so `linkFlows` matches deposited volume. |
-| **Material Bulking (`bulkOUT` / `bulkIN`)** | Looked up via `link.materialId || source.materialType`. Enforced during Stage 1 (`bulkOUT`), Stage 2 (`bulkIN` & same-day `bulkOUT`), and Stage 3 physical volume mutations (skipped for `null` junction storage). |
+| **`overflowMode = 'strict'` + `strictSubRule = 'transfer_through'`** | **Container Backup ("Transfer-Through"):** Configured with `overflowTriggerPct` (`1–100`, default `100`). Whenever `inboundDeposit > 0` and projected end-of-day volume exceeds `triggerCap = capacity * (overflowTriggerPct / 100)`, passes the surplus through connected outbound `linkRole = 'overflow'` links (ordered by `priority`, respecting `bulkOUT`/`bulkIN`, route caps, and backup target headroom; supports chaining `B → B2 → B3`). Never drains static stock when inbound is `0`, never pulls volume below `triggerCap`, and gracefully falls back to `throttleback` with an alert if backup containers saturate. Backup containers drain via normal outbound links. |
+| **Material Bulking (`bulkOUT` / `bulkIN`)** | Looked up via `link.materialId || source.materialType`. Enforced during Stage 1 (`bulkOUT`), Stage 2 (`bulkIN` & same-day `bulkOUT`), Stage 2B (`bulkOUT`/`bulkIN`), and Stage 3 physical volume mutations (skipped for `null` junction storage). |
 
-### 2.2 Transfer Rules (Baseline)
+### 2.2 Transfer Rules (Baseline & Diversions)
 
 | Property / Rule | Current Driving Logic |
 | :--- | :--- |
+| **`linkRole`** (`'primary' \| 'standby' \| 'overflow'`) | Defaults to `'primary'`. `'standby'` links remain dormant (`0` flow, `'idle'`) until their watched `primaryLinkId` delivers less than planned due to an enabled trigger; `'overflow'` links remain dormant until their source container activates `transfer_through`. |
+| **`primaryLinkId` & `diversionTriggers`** *(Standby Links)* | Watches a non-standby primary link. Enabled triggers (`'route'`, `'target'`, `'calendar'`, `'source'`) activate priority-ordered spillover for only the unmet remainder `max(0, primaryExpected - primaryDelivered)`, capped by the standby link's `dailyRate`, source stock, route corridor residual capacity, and target headroom. Supports both same-source and alternate-source diversions. |
+| **`backupCorridorIds` & `backupCorridorRate`** *(Backup Route Detour)* | When a link's primary corridor(s) block or cap flow in Stage 1.5A, Stage 1.5B automatically routes the unmet spillover remainder (`preRouteFlow - primaryRouteFlow`, optionally capped by `backupCorridorRate`) through `backupCorridorIds`, respecting each backup corridor's residual rate & fleet capacity. |
 | **`dailyRate`** | Base daily transfer demand (`m³/d`). If `<= EPS`, the transfer requests `0` flow (`frozen`). |
-| **`priority`** | Editable in Property Inspector (default `1`; lower number = higher precedence). Governs scarcity allocation in Stage 1 (source stock), Stage 1.25 (container cap), Stage 1.5 (route rate cap), and Stage 2 (target headroom & null junction balancing). Links sharing a priority tier split remaining budget pro-rata. |
+| **`priority`** | Editable in Property Inspector (default `1`; lower number = higher precedence). Governs scarcity allocation in Stage 1 (source stock), Stage 1.25 (container cap), Stage 1.5A/B (primary & backup route rate caps), Stage 2A (target headroom, overflow priority, & null junction balancing), and Stage 2B (standby activation order). Links sharing a priority tier split remaining budget pro-rata. |
 | **`materialId`** | Optional material override editable in Property Inspector. Overrides `source.materialType` for `allowedMaterials` validation and `bulkIN`/`bulkOUT` lookup. |
 | **`fleetCount`** | Editable in Property Inspector. Enforced against assigned Route Corridor `maxFleetCount` caps in Stage 1.5. |
 | **`rateSchedule`** *(legacy fallback)* | Evaluated only when no Calendar Transfer event is active on `day`. |
-| **Route Corridor Assignment (`corridorIds`)** | A transfer may reference 0, 1, or multiple Route Corridors. In Stage 1.5, it is subject to every assigned corridor (taking the tightest cap). |
+| **Route Corridor Assignment (`corridorIds`)** | A transfer may reference 0, 1, or multiple primary Route Corridors (and separate `backupCorridorIds` for spillover detours). |
 
 ### 2.3 Route Corridor Rules (Baseline)
 
@@ -127,6 +137,10 @@ Alerts are deduplicated per day and emitted for every rule transition or constra
 | **Capacity Throttleback** | Target in `strict` + `throttleback` and `totalPreTargetDeposit > effectiveHeadroom` | `Day {d}: Target {name} nearing capacity. Transfer rates throttled.` |
 | **Strict Capacity Reached** | Post-Stage 3 `strict` storage node has `vol >= capacity - EPS` (newly reached or full against demand) | `Day {d}: Node {name} reached capacity!` |
 | **Overfill Exceeded** | Post-Stage 3 `overfill` storage node has `vol > capacity + EPS` | `Day {d}: [OVERFILL] Node {name} exceeded capacity by {excess} m³!` |
+| **Backup Route Detour** | Primary corridor blocked/capped and `backupCorridorIds` carries spillover flow | `Day {d}: Transfer {src} → {tgt} detoured {vol} m³/d via backup route {routes}.` |
+| **Standby Transfer Spillover** | Standby link activates to carry unmet primary remainder | `Day {d}: Standby transfer {src} → {tgt} activated ({vol} m³/d spillover from {pSrc} → {pTgt}).` |
+| **Transfer-Through Active** | `transfer_through` container passes surplus through `overflow` link(s) | `Day {d}: Container {name} transfer-through active ({vol} m³/d overflow to backup).` |
+| **Transfer-Through Saturated** | Both primary container (100%) and overflow backup capacity saturate, falling back to `throttleback` | `Day {d}: Container {name} and backup overflow saturated. Upstream transfers throttled.` |
 
 ---
 
@@ -136,10 +150,12 @@ Alerts are deduplicated per day and emitted for every rule transition or constra
 
 | Colour | Hex | `FlowStatus` | Meaning |
 | :--- | :--- | :--- | :--- |
-| **Blue** | `#38bdf8` | `'frozen'`, `'starved'`, `'idle'` | Day 0 baseline, disconnected/idle element, empty container, or unable to deliver full rate due to lack of material |
+| **Blue** | `#38bdf8` | `'frozen'`, `'starved'` | Day 0 baseline, disconnected element, empty container, or unable to deliver full rate due to lack of material |
 | **Green** | `#22c55e` | `'full'` | Flowing at full expected rate |
+| **Violet** | `#a855f7` | `'diverted'` | Active standby transfer diversion, backup route corridor detour, or container transfer-through overflow |
 | **Amber** | `#f59e0b` | `'restricted'` | Flowing at reduced/throttled rate (target capacity throttleback, container/route cap, partial sibling link block, or reduced calendar variable rate) |
 | **Red** | `#ef4444` | `'blocked'` | Halted/blocked (strict capacity/headroom hold, overfill exceeded, static maintenance/block, material mismatch, or calendar blocked/stopped) |
+| **Slate** | `#64748b` | `'idle'` | Dormant standby/overflow transfer link (excluded from parent container status rollups so inactive backups never falsely tint containers Amber/Red) |
 
 ### 4.2 Classification Precedence Trees (Day `>= 1`)
 

@@ -5,7 +5,7 @@ interface RuleConfirmModalProps {
   onClose: () => void;
   onConfirm: () => void;
   ruleName: string;
-  ruleShape: 'circle' | 'diamond' | 'square';
+  ruleShape: 'circle' | 'diamond' | 'triangle' | 'square';
   containerCount: number;
 }
 
@@ -30,6 +30,12 @@ export const RuleConfirmModal: React.FC<RuleConfirmModalProps> = ({
       return (
         <svg width="14" height="14" viewBox="0 0 14 14" style={{ display: 'inline-block', verticalAlign: 'middle' }}>
           <polygon points="7,0.5 13.5,7 7,13.5 0.5,7" fill="#f8fafc" stroke="#0f172a" strokeWidth="1.5" />
+        </svg>
+      );
+    } else if (ruleShape === 'triangle') {
+      return (
+        <svg width="14" height="14" viewBox="0 0 14 14" style={{ display: 'inline-block', verticalAlign: 'middle' }}>
+          <polygon points="7,1 13.5,12.5 0.5,12.5" fill="#e9d5ff" stroke="#0f172a" strokeWidth="1.5" />
         </svg>
       );
     } else {

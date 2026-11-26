@@ -20,11 +20,14 @@ import {
   Point,
   OverflowMode,
   StrictSubRule,
+  LinkRole,
+  DiversionTrigger,
   MaterialDefinition,
   ClipboardData,
   ContainerProperties,
   LinkProperties,
-  getLinkCorridorIds
+  getLinkCorridorIds,
+  getLinkBackupCorridorIds
 } from './models/types';
 import { getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge, computeBestFitCorridorWaypoints } from './components/canvas/pipeRouter';
 
@@ -83,12 +86,13 @@ export default function App() {
     mode: OverflowMode;
     subRule?: StrictSubRule;
     name: string;
-    shape: 'circle' | 'diamond' | 'square';
+    shape: 'circle' | 'diamond' | 'square' | 'triangle';
   } | null>(null);
 
-  const getRuleMeta = (mode: OverflowMode, subRule?: StrictSubRule): { name: string; shape: 'circle' | 'diamond' | 'square' } => {
+  const getRuleMeta = (mode: OverflowMode, subRule?: StrictSubRule): { name: string; shape: 'circle' | 'diamond' | 'square' | 'triangle' } => {
     if (mode === 'overfill') return { name: 'Overfill', shape: 'square' };
     if (subRule === 'headroom_hold') return { name: 'Headroom Hold', shape: 'diamond' };
+    if (subRule === 'transfer_through') return { name: 'Transfer-Through', shape: 'triangle' };
     return { name: 'Throttleback', shape: 'circle' };
   };
 
@@ -139,6 +143,7 @@ export default function App() {
           overflowMode: sourceNode.overflowMode,
           strictSubRule: sourceNode.strictSubRule,
           headroomThreshold: sourceNode.headroomThreshold,
+          overflowTriggerPct: sourceNode.overflowTriggerPct,
           status: sourceNode.status,
           allowedMaterials: sourceNode.allowedMaterials ? [...sourceNode.allowedMaterials] : undefined,
           notes: sourceNode.notes
@@ -511,7 +516,12 @@ export default function App() {
               const overflowMode: OverflowMode = rawOverflow === 'overfill' ? 'overfill' : 'strict';
 
               const rawSubRule = parts[10]?.replace(/^"|"$/g, '').trim().toLowerCase();
-              const strictSubRule: StrictSubRule = rawSubRule === 'headroom_hold' ? 'headroom_hold' : 'throttleback';
+              const strictSubRule: StrictSubRule =
+                rawSubRule === 'headroom_hold'
+                  ? 'headroom_hold'
+                  : rawSubRule === 'transfer_through'
+                  ? 'transfer_through'
+                  : 'throttleback';
 
               const rawHeadroom = parts[11]?.trim();
               const headroomThreshold = rawHeadroom ? parseFloat(rawHeadroom) : 500;
@@ -557,6 +567,16 @@ export default function App() {
                 if (codes.length > 0) allowedMaterials = Array.from(new Set(codes));
               }
 
+              const overflowTriggerIdx = nodeHeaderCols.indexOf('overflowtriggerpct');
+              let overflowTriggerPct: number | undefined = undefined;
+              if (overflowTriggerIdx !== -1 && parts[overflowTriggerIdx] !== undefined) {
+                const rawTrigger = parts[overflowTriggerIdx].replace(/^"|"$/g, '').trim();
+                const parsedTrigger = parseFloat(rawTrigger);
+                if (rawTrigger !== '' && !isNaN(parsedTrigger)) {
+                  overflowTriggerPct = Math.max(1, Math.min(100, Math.round(parsedTrigger)));
+                }
+              }
+
               parsedNodes.push({
                 id: parts[0].trim(),
                 name: parts[1].replace(/^"|"$/g, '').trim(),
@@ -570,6 +590,7 @@ export default function App() {
                 overflowMode,
                 strictSubRule,
                 headroomThreshold: isNaN(headroomThreshold) ? 500 : headroomThreshold,
+                ...(overflowTriggerPct !== undefined ? { overflowTriggerPct } : {}),
                 status,
                 ...(allowedMaterials ? { allowedMaterials } : {}),
                 ...(outputEdge ? { outputEdge } : {}),
@@ -648,6 +669,59 @@ export default function App() {
                 }
               }
 
+              const linkRoleIdx = linkHeaderCols.indexOf('linkrole');
+              let linkRole: LinkRole | undefined = undefined;
+              if (linkRoleIdx !== -1 && parts[linkRoleIdx] !== undefined) {
+                const rawRole = parts[linkRoleIdx].replace(/^"|"$/g, '').trim().toLowerCase();
+                if (rawRole === 'standby' || rawRole === 'overflow' || rawRole === 'primary') {
+                  linkRole = rawRole;
+                }
+              }
+
+              const primaryLinkIdx = linkHeaderCols.indexOf('primarylinkid');
+              let primaryLinkId: string | undefined = undefined;
+              if (primaryLinkIdx !== -1 && parts[primaryLinkIdx] !== undefined) {
+                const rawPrimary = parts[primaryLinkIdx].replace(/^"|"$/g, '').trim();
+                if (rawPrimary) primaryLinkId = rawPrimary;
+              }
+
+              const triggersIdx = linkHeaderCols.indexOf('diversiontriggers');
+              let diversionTriggers: DiversionTrigger[] | undefined = undefined;
+              if (triggersIdx !== -1 && parts[triggersIdx] !== undefined) {
+                const rawTriggers = parts[triggersIdx].replace(/^"|"$/g, '').trim();
+                const validTriggers: DiversionTrigger[] = ['route', 'target', 'calendar', 'source'];
+                const parsedTriggers = rawTriggers
+                  .split('|')
+                  .map(s => s.trim().toLowerCase())
+                  .filter((t): t is DiversionTrigger => validTriggers.includes(t as DiversionTrigger));
+                if (parsedTriggers.length > 0) {
+                  diversionTriggers = Array.from(new Set(parsedTriggers));
+                }
+              }
+
+              const backupCorridorIdx = linkHeaderCols.indexOf('backupcorridorids');
+              let backupCorridorIds: string[] | undefined = undefined;
+              if (backupCorridorIdx !== -1 && parts[backupCorridorIdx] !== undefined) {
+                const rawBackup = parts[backupCorridorIdx].replace(/^"|"$/g, '').trim();
+                const splitBackup = rawBackup
+                  .split('|')
+                  .map(s => s.trim())
+                  .filter(Boolean);
+                if (splitBackup.length > 0) {
+                  backupCorridorIds = Array.from(new Set(splitBackup));
+                }
+              }
+
+              const backupRateIdx = linkHeaderCols.indexOf('backupcorridorrate');
+              let backupCorridorRate: number | undefined = undefined;
+              if (backupRateIdx !== -1 && parts[backupRateIdx] !== undefined) {
+                const rawBackupRate = parts[backupRateIdx].replace(/^"|"$/g, '').trim();
+                const parsedBackupRate = parseFloat(rawBackupRate);
+                if (rawBackupRate !== '' && !isNaN(parsedBackupRate)) {
+                  backupCorridorRate = Math.max(0, parsedBackupRate);
+                }
+              }
+
               parsedLinks.push({
                 id: parts[0].trim(),
                 sourceId: parts[1].trim(),
@@ -657,6 +731,11 @@ export default function App() {
                 priority: isNaN(priority) ? 1 : priority,
                 materialId: materialId || undefined,
                 corridorIds,
+                ...(linkRole ? { linkRole } : {}),
+                ...(primaryLinkId ? { primaryLinkId } : {}),
+                ...(diversionTriggers ? { diversionTriggers } : {}),
+                ...(backupCorridorIds ? { backupCorridorIds } : {}),
+                ...(backupCorridorRate !== undefined ? { backupCorridorRate } : {}),
                 notes: notes || undefined
               });
             }
@@ -850,6 +929,7 @@ export default function App() {
         overflowMode: targetNode.overflowMode,
         strictSubRule: targetNode.strictSubRule,
         headroomThreshold: targetNode.headroomThreshold,
+        overflowTriggerPct: targetNode.overflowTriggerPct,
         status: targetNode.status,
         allowedMaterials: targetNode.allowedMaterials ? [...targetNode.allowedMaterials] : undefined,
         notes: targetNode.notes
@@ -863,12 +943,17 @@ export default function App() {
       showToast(`Copied properties from container "${targetNode.name}"`, 'success');
     } else if (selectedKind === 'link' && selectedLink) {
       const copiedCorridorIds = getLinkCorridorIds(selectedLink);
+      const copiedBackupCorridorIds = getLinkBackupCorridorIds(selectedLink);
       const properties: LinkProperties = {
         dailyRate: selectedLink.dailyRate,
         fleetCount: selectedLink.fleetCount,
         materialId: selectedLink.materialId,
         priority: selectedLink.priority,
         corridorIds: copiedCorridorIds.length > 0 ? copiedCorridorIds : undefined,
+        linkRole: selectedLink.linkRole,
+        diversionTriggers: selectedLink.diversionTriggers ? [...selectedLink.diversionTriggers] : undefined,
+        backupCorridorIds: copiedBackupCorridorIds.length > 0 ? copiedBackupCorridorIds : undefined,
+        backupCorridorRate: selectedLink.backupCorridorRate,
         rateSchedule: selectedLink.rateSchedule ? [...selectedLink.rateSchedule] : undefined,
         notes: selectedLink.notes
       };
@@ -914,6 +999,7 @@ export default function App() {
         overflowMode: clipboard.properties.overflowMode,
         strictSubRule: clipboard.properties.strictSubRule,
         headroomThreshold: clipboard.properties.headroomThreshold,
+        overflowTriggerPct: clipboard.properties.overflowTriggerPct,
         status: clipboard.properties.status,
         allowedMaterials: clipboard.properties.allowedMaterials ? [...clipboard.properties.allowedMaterials] : undefined,
         notes: clipboard.properties.notes
@@ -925,6 +1011,7 @@ export default function App() {
       showToast(`Pasted properties into ${count} container${count > 1 ? 's' : ''}`, 'success');
     } else if (clipboard.type === 'link' && selectedLink) {
       const pastedCorridorIds = getLinkCorridorIds(clipboard.properties);
+      const pastedBackupCorridorIds = getLinkBackupCorridorIds(clipboard.properties);
       const updateData: Partial<TransferLink> = {
         dailyRate: clipboard.properties.dailyRate,
         fleetCount: clipboard.properties.fleetCount,
@@ -932,6 +1019,11 @@ export default function App() {
         priority: clipboard.properties.priority,
         corridorIds: pastedCorridorIds.length > 0 ? pastedCorridorIds : undefined,
         corridorId: undefined,
+        linkRole: clipboard.properties.linkRole,
+        primaryLinkId: undefined,
+        diversionTriggers: clipboard.properties.diversionTriggers ? [...clipboard.properties.diversionTriggers] : undefined,
+        backupCorridorIds: pastedBackupCorridorIds.length > 0 ? pastedBackupCorridorIds : undefined,
+        backupCorridorRate: clipboard.properties.backupCorridorRate,
         rateSchedule: clipboard.properties.rateSchedule ? [...clipboard.properties.rateSchedule] : undefined,
         notes: clipboard.properties.notes
       };
@@ -1051,9 +1143,21 @@ export default function App() {
     setNodes(vm.getNodes().map(n => ({ ...n })));
   };
 
+  const handleUpdateNodeById = (nodeId: string, updates: Partial<ContainerNode>) => {
+    if (isPlayback) return;
+    vm.updateNode(nodeId, updates);
+    setNodes(vm.getNodes().map(n => ({ ...n })));
+  };
+
   const handleUpdateLink = (field: keyof TransferLink, val: any) => {
     if (!selectedLink || isPlayback) return;
     vm.updateLink(selectedLink.id, { [field]: val });
+    setLinks([...vm.getLinks()]);
+  };
+
+  const handleUpdateLinkFields = (linkId: string, updates: Partial<TransferLink>) => {
+    if (isPlayback) return;
+    vm.updateLink(linkId, updates);
     setLinks([...vm.getLinks()]);
   };
 
@@ -1066,6 +1170,12 @@ export default function App() {
   const handleToggleLinkCorridor = (linkId: string, corridorId: string, assign: boolean) => {
     if (isPlayback) return;
     vm.toggleLinkCorridor(linkId, corridorId, assign);
+    setLinks([...vm.getLinks()]);
+  };
+
+  const handleToggleLinkBackupCorridor = (linkId: string, corridorId: string, assign: boolean) => {
+    if (isPlayback) return;
+    vm.toggleLinkBackupCorridor(linkId, corridorId, assign);
     setLinks([...vm.getLinks()]);
   };
 
@@ -1172,12 +1282,15 @@ export default function App() {
           onPaste={handlePaste}
           onClearClipboard={handleClearClipboard}
           onUpdateSingleNode={handleUpdateSingleNode}
+          onUpdateNodeById={handleUpdateNodeById}
           onUpdateLink={handleUpdateLink}
+          onUpdateLinkFields={handleUpdateLinkFields}
           onUpdateCorridor={handleUpdateCorridor}
           onUpdateCalendarEvent={handleUpdateCalendarEvent}
           onDeleteCalendarEvent={handleDeleteCalendarEvent}
           onSelectTargetElement={handleSelectTargetElement}
           onToggleLinkCorridor={handleToggleLinkCorridor}
+          onToggleLinkBackupCorridor={handleToggleLinkBackupCorridor}
           onSetRouteLanes={handleSetRouteLanes}
           onUnlinkLanes={handleUnlinkLanes}
           onDeleteSelected={handleDeleteSelected}

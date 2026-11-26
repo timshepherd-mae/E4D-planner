@@ -11,8 +11,12 @@ import {
   MaterialDefinition,
   OverflowMode,
   StrictSubRule,
+  LinkRole,
+  DiversionTrigger,
   ClipboardData,
-  getLinkCorridorIds
+  getLinkCorridorIds,
+  getLinkBackupCorridorIds,
+  getLinkRole
 } from '../../models/types';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
 import { resolveOrderedCorridorChain } from '../canvas/pipeRouter';
@@ -43,12 +47,15 @@ interface PropertyInspectorProps {
   onPaste: () => void;
   onClearClipboard: () => void;
   onUpdateSingleNode: (field: keyof ContainerNode, val: any) => void;
+  onUpdateNodeById?: (nodeId: string, updates: Partial<ContainerNode>) => void;
   onUpdateLink: (field: keyof TransferLink, val: any) => void;
+  onUpdateLinkFields?: (linkId: string, updates: Partial<TransferLink>) => void;
   onUpdateCorridor: (field: keyof RouteCorridor, val: any) => void;
   onUpdateCalendarEvent: (eventId: string, updates: Partial<CalendarEvent>) => void;
   onDeleteCalendarEvent: (eventId: string) => void;
   onSelectTargetElement: (targetType: CalendarTargetType, targetId: string) => void;
   onToggleLinkCorridor: (linkId: string, corridorId: string, assign: boolean) => void;
+  onToggleLinkBackupCorridor: (linkId: string, corridorId: string, assign: boolean) => void;
   onSetRouteLanes: () => void;
   onUnlinkLanes: () => void;
   onDeleteSelected: () => void;
@@ -82,12 +89,15 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   onPaste,
   onClearClipboard,
   onUpdateSingleNode,
+  onUpdateNodeById,
   onUpdateLink,
+  onUpdateLinkFields,
   onUpdateCorridor,
   onUpdateCalendarEvent,
   onDeleteCalendarEvent,
   onSelectTargetElement,
   onToggleLinkCorridor,
+  onToggleLinkBackupCorridor,
   onSetRouteLanes,
   onUnlinkLanes,
   onDeleteSelected,
@@ -420,13 +430,15 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               : singleSelectedNode.status === 'blocked' || singleSelectedNode.status === 'maintenance'
               ? `Blocked (${singleSelectedNode.status === 'maintenance' ? 'Maintenance' : 'Static Status'})`
               : 'Blocked (Capacity Constraint)';
+            const overflowOut = currentFrame?.overflowActiveNodes?.[singleSelectedNode.id] ?? 0;
             const statusConfig = {
               full: { label: 'Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
+              diverted: { label: overflowOut > 0 ? 'Transfer-Through Active' : 'Diverted / Detour Active', color: '#a855f7', bg: 'rgba(168, 85, 247, 0.15)', border: '#a855f7' },
               restricted: { label: activeCalEvt?.state === 'restricted' ? 'Restricted (Calendar Throughput Cap)' : 'Flowing at Restricted Rate', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
               blocked: { label: blockedLabel, color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
               starved: { label: 'Cannot Deliver (Lack of Material)', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Inactive / Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
-              idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
+              idle: { label: 'Idle (Dormant)', color: '#94a3b8', bg: 'rgba(100, 116, 139, 0.15)', border: '#64748b' }
             }[nodeStatus] || { label: 'Frozen', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' };
 
             const fillPct = singleSelectedNode.capacity > 0
@@ -447,6 +459,13 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
                     Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong>
                     {activeCalEvt.state === 'restricted' ? ` (Cap ${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d)` : ''} (D{activeCalEvt.startDay}–D{activeCalEvt.endDay})
+                  </div>
+                )}
+
+                {overflowOut > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#e9d5ff', backgroundColor: 'rgba(168, 85, 247, 0.12)', border: '1px solid rgba(168, 85, 247, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
+                    <span>Transferred Through:</span>
+                    <span style={{ fontWeight: 700 }}>{Math.round(overflowOut).toLocaleString()} m³/d</span>
                   </div>
                 )}
 
@@ -479,22 +498,43 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           {selectedLink && (() => {
             const linkFlow = currentFrame ? (currentFrame.linkFlows[selectedLink.id] ?? 0) : 0;
             const linkStatus = currentFrame?.linkStatuses?.[selectedLink.id] ?? 'frozen';
+            const linkRole = getLinkRole(selectedLink);
+            const routeSplit = currentFrame?.linkRouteSplits?.[selectedLink.id];
+            const standbyInfo = currentFrame?.standbyActivatedFrom?.[selectedLink.id];
+            const standbyFromLink = standbyInfo ? links.find(l => l.id === standbyInfo.primaryLinkId) : undefined;
+            const standbyFromSrc = standbyFromLink ? nodes.find(n => n.id === standbyFromLink.sourceId) : undefined;
+            const standbyFromTgt = standbyFromLink ? nodes.find(n => n.id === standbyFromLink.targetId) : undefined;
             const source = vm.getNodes().find(n => n.id === selectedLink.sourceId);
             const target = vm.getNodes().find(n => n.id === selectedLink.targetId);
             const activeCalEvt = getActiveCalendarEventForTarget('transfer', selectedLink.id);
 
+            const divertedLabel =
+              linkRole === 'overflow'
+                ? 'Active Transfer-Through Overflow'
+                : linkRole === 'standby'
+                ? 'Active Standby Diversion'
+                : 'Active Backup Route Detour';
+
             const statusConfig = {
               full: { label: 'Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
+              diverted: { label: divertedLabel, color: '#a855f7', bg: 'rgba(168, 85, 247, 0.15)', border: '#a855f7' },
               restricted: { label: 'Flowing at Restricted Rate', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
               blocked: { label: activeCalEvt?.state === 'stopped' ? 'Stopped (Calendar Event)' : 'Blocked (Capacity / Schedule)', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
               starved: { label: 'Cannot Deliver (Lack of Material)', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Inactive / Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
-              idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
+              idle: { label: linkRole === 'standby' ? 'Standby (Dormant)' : linkRole === 'overflow' ? 'Overflow (Dormant)' : 'Idle', color: '#94a3b8', bg: 'rgba(100, 116, 139, 0.15)', border: '#64748b' }
             }[linkStatus] || { label: 'Frozen', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' };
 
             return (
               <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>TRANSFER LINK TELEMETRY</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>TRANSFER LINK TELEMETRY</span>
+                  {linkRole !== 'primary' && (
+                    <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', color: '#c084fc', backgroundColor: 'rgba(168, 85, 247, 0.16)', border: '1px solid rgba(168, 85, 247, 0.45)', borderRadius: '3px', padding: '1px 6px' }}>
+                      {linkRole === 'standby' ? 'STBY' : 'OVF'}
+                    </span>
+                  )}
+                </div>
                 <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#f8fafc' }}>{source?.name ?? 'Source'} → {target?.name ?? 'Target'}</div>
 
                 <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 8px', borderRadius: '4px', backgroundColor: statusConfig.bg, border: `1px solid ${statusConfig.border}`, color: statusConfig.color, fontSize: '11px', fontWeight: 600, width: 'fit-content' }}>
@@ -506,6 +546,25 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   <div style={{ fontSize: '11px', color: '#fde68a', backgroundColor: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
                     Calendar override: <strong style={{ textTransform: 'uppercase' }}>{activeCalEvt.state}</strong>
                     {activeCalEvt.state === 'variable' ? ` (${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d)` : ''} · D{activeCalEvt.startDay}–D{activeCalEvt.endDay}
+                  </div>
+                )}
+
+                {routeSplit && routeSplit.backupFlow > 0 && (
+                  <div style={{ backgroundColor: 'rgba(168, 85, 247, 0.12)', border: '1px solid rgba(168, 85, 247, 0.35)', borderRadius: '4px', padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '3px', fontSize: '11px', color: '#e9d5ff', fontVariantNumeric: 'tabular-nums' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>Primary Route:</span>
+                      <span style={{ fontWeight: 600 }}>{Math.round(routeSplit.primaryFlow).toLocaleString()} m³/d</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>Backup Detour:</span>
+                      <span style={{ fontWeight: 700, color: '#d8b4fe' }}>{Math.round(routeSplit.backupFlow).toLocaleString()} m³/d</span>
+                    </div>
+                  </div>
+                )}
+
+                {standbyFromLink && (
+                  <div style={{ fontSize: '11px', color: '#e9d5ff', backgroundColor: 'rgba(168, 85, 247, 0.12)', border: '1px solid rgba(168, 85, 247, 0.35)', borderRadius: '4px', padding: '5px 8px' }}>
+                    Spillover from: <strong>{standbyFromSrc?.name ?? standbyFromLink.sourceId} → {standbyFromTgt?.name ?? standbyFromLink.targetId}</strong>
                   </div>
                 )}
 
@@ -526,20 +585,23 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
           {/* Selected Route Corridor Live Telemetry */}
           {selectedCorridor && (() => {
             const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(selectedCorridor.id));
+            const backupLinks = links.filter(l => getLinkBackupCorridorIds(l).includes(selectedCorridor.id));
             const combinedLiveFlow =
               currentFrame?.corridorFlows?.[selectedCorridor.id] ??
               assignedLinks.reduce((sum, l) => sum + (currentFrame?.linkFlows?.[l.id] ?? 0), 0);
+            const detourFlow = currentFrame?.backupCorridorFlows?.[selectedCorridor.id] ?? 0;
             const combinedPlanned = assignedLinks.reduce((sum, l) => sum + l.dailyRate, 0);
             const corridorStatus = currentFrame?.corridorStatuses?.[selectedCorridor.id] ?? 'frozen';
             const activeCalEvt = getActiveCalendarEventForTarget('route', selectedCorridor.id);
 
             const statusConfig = {
               full: { label: 'Open / Flowing at Full Rate', color: '#22c55e', bg: 'rgba(34, 197, 94, 0.15)', border: '#22c55e' },
+              diverted: { label: 'Active Detour Spillover Corridor', color: '#a855f7', bg: 'rgba(168, 85, 247, 0.15)', border: '#a855f7' },
               restricted: { label: 'Restricted Route Cap Active', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
               blocked: { label: 'Route Blocked', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444' },
               starved: { label: 'Assigned Sources Starved', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
               frozen: { label: currentDay === 0 ? 'Day 0 (Frozen)' : 'Idle / No Flow', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' },
-              idle: { label: 'Idle', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' }
+              idle: { label: 'Backup Route (Dormant)', color: '#94a3b8', bg: 'rgba(100, 116, 139, 0.15)', border: '#64748b' }
             }[corridorStatus] || { label: 'Frozen', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.15)', border: '#38bdf8' };
 
             return (
@@ -556,6 +618,12 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     {activeCalEvt.state === 'restricted' ? ` (Cap ${Math.round(activeCalEvt.rateValue ?? 0).toLocaleString()} m³/d)` : ''} · D{activeCalEvt.startDay}–D{activeCalEvt.endDay}
                   </div>
                 )}
+                {detourFlow > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#e9d5ff', backgroundColor: 'rgba(168, 85, 247, 0.12)', border: '1px solid rgba(168, 85, 247, 0.35)', borderRadius: '4px', padding: '5px 8px', fontVariantNumeric: 'tabular-nums' }}>
+                    <span>Detour Spillover Flow:</span>
+                    <span style={{ fontWeight: 700 }}>{Math.round(detourFlow).toLocaleString()} m³/d</span>
+                  </div>
+                )}
                 {(selectedCorridor.maxDailyRate !== undefined || selectedCorridor.maxFleetCount !== undefined) && (
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
                     <span>Baseline Limits:</span>
@@ -569,6 +637,11 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   <span>Combined Corridor Flow:</span>
                   <span style={{ fontWeight: 600 }}>{Math.round(combinedLiveFlow).toLocaleString()} / {Math.round(combinedPlanned).toLocaleString()} m³/d</span>
                 </div>
+                {backupLinks.length > 0 && (
+                  <div style={{ fontSize: '10px', color: '#c084fc' }}>
+                    Assigned as backup detour for {backupLinks.length} transfer{backupLinks.length > 1 ? 's' : ''}.
+                  </div>
+                )}
               </div>
             );
           })()}
@@ -578,20 +651,28 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600, marginBottom: '8px' }}>SIMULATION COLOR KEY</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '11px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#38bdf8' }}>
-                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#38bdf8', display: 'inline-block' }} />
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#38bdf8', display: 'inline-block', flexShrink: 0 }} />
                 <span><strong>Blue:</strong> Day 0 (Frozen) / Lack of Material</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#22c55e' }}>
-                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#22c55e', display: 'inline-block' }} />
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#22c55e', display: 'inline-block', flexShrink: 0 }} />
                 <span><strong>Green:</strong> Flowing at full rate</span>
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#a855f7' }}>
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#a855f7', display: 'inline-block', flexShrink: 0 }} />
+                <span><strong>Violet:</strong> Diverted / Detour / Transfer-Through</span>
+              </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f59e0b' }}>
-                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#f59e0b', display: 'inline-block' }} />
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#f59e0b', display: 'inline-block', flexShrink: 0 }} />
                 <span><strong>Amber:</strong> Flowing at restricted rate</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#ef4444' }}>
-                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#ef4444', display: 'inline-block' }} />
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#ef4444', display: 'inline-block', flexShrink: 0 }} />
                 <span><strong>Red:</strong> Blocked due to capacity issues</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8' }}>
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#64748b', display: 'inline-block', flexShrink: 0 }} />
+                <span><strong>Slate:</strong> Standby / Overflow (Dormant)</span>
               </div>
             </div>
           </div>
@@ -987,6 +1068,7 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                       >
                         <option value="throttleback">Proportional Throttleback</option>
                         <option value="headroom_hold">Headroom Hold (X Spare Space)</option>
+                        <option value="transfer_through">Transfer-Through (Overflow Backup)</option>
                       </select>
                     </div>
 
@@ -997,10 +1079,92 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                           type="number"
                           value={singleSelectedNode.headroomThreshold ?? 500}
                           onChange={e => onUpdateSingleNode('headroomThreshold', Number(e.target.value))}
-                          style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '6px', fontSize: '11px' }}
+                          style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '6px', fontSize: '11px', fontVariantNumeric: 'tabular-nums' }}
                         />
                       </div>
                     )}
+
+                    {singleSelectedNode.strictSubRule === 'transfer_through' && (() => {
+                      const triggerPct = Math.max(1, Math.min(100, singleSelectedNode.overflowTriggerPct ?? 100));
+                      const triggerVol = Math.round(singleSelectedNode.capacity * (triggerPct / 100));
+                      const connectedOverflowLinks = links
+                        .filter(l => l.sourceId === singleSelectedNode.id && getLinkRole(l) === 'overflow')
+                        .sort((a, b) => (a.priority ?? 1) - (b.priority ?? 1));
+
+                      return (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '4px', paddingTop: '8px', borderTop: '1px solid #1e293b' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <label style={{ fontSize: '11px', color: '#c084fc', fontWeight: 600 }}>Activation Trigger (% Full)</label>
+                              <span style={{ fontSize: '10px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
+                                {triggerVol.toLocaleString()} m³
+                              </span>
+                            </div>
+                            <input
+                              type="number"
+                              min={1}
+                              max={100}
+                              step={1}
+                              value={triggerPct}
+                              onChange={e => {
+                                const raw = Number(e.target.value);
+                                if (!Number.isFinite(raw)) return;
+                                onUpdateSingleNode('overflowTriggerPct', Math.max(1, Math.min(100, Math.round(raw))));
+                              }}
+                              style={{ backgroundColor: '#1e293b', border: '1px solid rgba(168, 85, 247, 0.5)', borderRadius: '4px', color: '#f8fafc', padding: '6px', fontSize: '11px', fontVariantNumeric: 'tabular-nums' }}
+                            />
+                          </div>
+
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span style={{ fontSize: '10px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase' }}>
+                                Connected Overflow Links ({connectedOverflowLinks.length})
+                              </span>
+                            </div>
+                            {connectedOverflowLinks.length === 0 ? (
+                              <div style={{ fontSize: '10px', color: '#cbd5e1', backgroundColor: 'rgba(168, 85, 247, 0.08)', border: '1px dashed rgba(168, 85, 247, 0.45)', borderRadius: '4px', padding: '7px 8px', lineHeight: 1.4 }}>
+                                Draw a transfer link from <strong>{singleSelectedNode.name}</strong> to an adjacent backup container and set its <strong>Link Role</strong> to <strong>Overflow</strong>. Falls back to Throttleback if none are available.
+                              </div>
+                            ) : (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                {connectedOverflowLinks.map(ovf => {
+                                  const tgt = nodes.find(n => n.id === ovf.targetId);
+                                  return (
+                                    <button
+                                      key={ovf.id}
+                                      type="button"
+                                      onClick={() => onSelectTargetElement('transfer', ovf.id)}
+                                      style={{
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        alignItems: 'center',
+                                        gap: '6px',
+                                        padding: '5px 8px',
+                                        backgroundColor: 'rgba(168, 85, 247, 0.10)',
+                                        border: '1px solid rgba(168, 85, 247, 0.35)',
+                                        borderRadius: '4px',
+                                        color: '#e9d5ff',
+                                        fontSize: '11px',
+                                        cursor: 'pointer',
+                                        textAlign: 'left'
+                                      }}
+                                      title="Select overflow transfer link"
+                                    >
+                                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }}>
+                                        P{ovf.priority ?? 1} → {tgt?.name || ovf.targetId}
+                                      </span>
+                                      <span style={{ fontSize: '10px', color: '#c084fc', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>
+                                        {Math.round(ovf.dailyRate).toLocaleString()} m³/d
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </>
                 )}
               </div>
@@ -1082,144 +1246,479 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             </div>
           )}
 
-          {isPureSingleLink && selectedLink && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              <div style={{ fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px' }}>
-                Selected: <strong style={{ color: '#38bdf8' }}>Transfer Link</strong>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Daily Rate (m³/day)</label>
-                <input type="number" value={selectedLink.dailyRate} onChange={e => onUpdateLink('dailyRate', Number(e.target.value))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Fleet Count</label>
-                  <input type="number" min={0} value={selectedLink.fleetCount} onChange={e => onUpdateLink('fleetCount', Math.max(0, Number(e.target.value) || 0))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Priority (1 = High)</label>
-                  <input type="number" min={1} max={99} value={selectedLink.priority ?? 1} onChange={e => onUpdateLink('priority', Math.max(1, Math.round(Number(e.target.value) || 1)))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
-                </div>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Material Override</label>
-                <select
-                  value={selectedLink.materialId || ''}
-                  onChange={e => onUpdateLink('materialId', e.target.value || undefined)}
-                  style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
-                >
-                  <option value="">Default (Inherit Source Material)</option>
-                  {materials.map(mat => (
-                    <option key={mat.code} value={mat.code}>
-                      {mat.code} — {mat.name} (IN: {mat.bulkIN}, OUT: {mat.bulkOUT})
-                    </option>
-                  ))}
-                </select>
-              </div>
+          {isPureSingleLink && selectedLink && (() => {
+            const currentRole = getLinkRole(selectedLink);
+            const srcNode = nodes.find(n => n.id === selectedLink.sourceId);
+            const tgtNode = nodes.find(n => n.id === selectedLink.targetId);
+            const assignedIds = getLinkCorridorIds(selectedLink);
+            const backupIds = getLinkBackupCorridorIds(selectedLink);
+            const assignedCorridors = assignedIds
+              .map(id => corridors.find(c => c.id === id))
+              .filter((c): c is RouteCorridor => Boolean(c));
+            const orderedChain =
+              srcNode && tgtNode
+                ? resolveOrderedCorridorChain(srcNode, tgtNode, assignedCorridors)
+                : [];
+            const stepOrderMap = new Map(orderedChain.map((step, idx) => [step.corridor.id, idx + 1]));
 
-              {(() => {
-                const assignedIds = getLinkCorridorIds(selectedLink);
-                const srcNode = nodes.find(n => n.id === selectedLink.sourceId);
-                const tgtNode = nodes.find(n => n.id === selectedLink.targetId);
-                const assignedCorridors = assignedIds
-                  .map(id => corridors.find(c => c.id === id))
-                  .filter((c): c is RouteCorridor => Boolean(c));
-                const orderedChain =
-                  srcNode && tgtNode
-                    ? resolveOrderedCorridorChain(srcNode, tgtNode, assignedCorridors)
-                    : [];
-                const stepOrderMap = new Map(orderedChain.map((step, idx) => [step.corridor.id, idx + 1]));
+            const watchablePrimaryLinks = links.filter(l => l.id !== selectedLink.id && getLinkRole(l) !== 'standby');
+            const watchingStandbyLinks = links
+              .filter(l => getLinkRole(l) === 'standby' && l.primaryLinkId === selectedLink.id)
+              .sort((a, b) => (a.priority ?? 1) - (b.priority ?? 1));
 
-                return (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Route Corridors</label>
-                      <span style={{ fontSize: '10px', color: assignedIds.length > 0 ? '#38bdf8' : '#64748b', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
-                        {assignedIds.length > 0 ? `${assignedIds.length} active (auto-ordered)` : 'Direct Route'}
-                      </span>
-                    </div>
-                    {corridors.length === 0 ? (
-                      <div style={{ fontSize: '11px', color: '#64748b', backgroundColor: '#0f172a', padding: '10px', borderRadius: '4px', border: '1px solid #334155' }}>
-                        No route corridors in model. Click <strong>+ route</strong> to create one.
+            const watchedPrimary = selectedLink.primaryLinkId
+              ? links.find(l => l.id === selectedLink.primaryLinkId)
+              : undefined;
+            const isAltSourceStandby = watchedPrimary ? watchedPrimary.sourceId !== selectedLink.sourceId : false;
+            const activeTriggers: DiversionTrigger[] =
+              selectedLink.diversionTriggers && selectedLink.diversionTriggers.length > 0
+                ? selectedLink.diversionTriggers
+                : isAltSourceStandby
+                ? ['route', 'target', 'calendar', 'source']
+                : ['route', 'target', 'calendar'];
+
+            const handleSetRole = (nextRole: LinkRole) => {
+              const updates: Partial<TransferLink> = { linkRole: nextRole };
+              if (nextRole !== 'standby') {
+                updates.primaryLinkId = undefined;
+              } else if (!selectedLink.diversionTriggers || selectedLink.diversionTriggers.length === 0) {
+                updates.diversionTriggers = ['route', 'target', 'calendar'];
+              }
+              if (onUpdateLinkFields) {
+                onUpdateLinkFields(selectedLink.id, updates);
+              } else {
+                onUpdateLink('linkRole', nextRole);
+                if (nextRole !== 'standby') onUpdateLink('primaryLinkId', undefined);
+              }
+            };
+
+            const handleToggleTrigger = (trigger: DiversionTrigger, checked: boolean) => {
+              const next = checked
+                ? Array.from(new Set([...activeTriggers, trigger]))
+                : activeTriggers.filter(t => t !== trigger);
+              onUpdateLink('diversionTriggers', next);
+            };
+
+            const triggerOptions: { key: DiversionTrigger; label: string }[] = [
+              { key: 'route', label: 'Route Blocked / Capped' },
+              { key: 'target', label: 'Target Full / Blocked' },
+              { key: 'calendar', label: 'Calendar Stopped / Reduced' },
+              { key: 'source', label: 'Source Starved / Blocked' }
+            ];
+
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '140px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px' }}>
+                  <span>Selected: <strong style={{ color: '#38bdf8' }}>Transfer Link</strong></span>
+                  {currentRole !== 'primary' && (
+                    <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', color: '#c084fc' }}>
+                      {currentRole}
+                    </span>
+                  )}
+                </div>
+
+                {/* Link Role Selector */}
+                <div style={{ backgroundColor: '#0f172a', padding: '10px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Link Role</label>
+                    <span style={{ fontSize: '10px', color: currentRole === 'primary' ? '#64748b' : '#c084fc', fontWeight: 600 }}>
+                      {currentRole === 'primary' ? 'Standard Transfer' : currentRole === 'standby' ? 'Spillover Diversion' : 'Container Backup'}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '4px' }}>
+                    {(['primary', 'standby', 'overflow'] as LinkRole[]).map(role => {
+                      const active = currentRole === role;
+                      const accent = role === 'primary' ? '#38bdf8' : '#a855f7';
+                      const activeBg = role === 'primary' ? 'rgba(56, 189, 248, 0.16)' : 'rgba(168, 85, 247, 0.20)';
+                      return (
+                        <button
+                          key={role}
+                          type="button"
+                          onClick={() => handleSetRole(role)}
+                          style={{
+                            padding: '6px 4px',
+                            borderRadius: '4px',
+                            border: active ? `1px solid ${accent}` : '1px solid #334155',
+                            backgroundColor: active ? activeBg : '#1e293b',
+                            color: active ? '#f8fafc' : '#94a3b8',
+                            fontSize: '11px',
+                            fontWeight: active ? 700 : 600,
+                            cursor: 'pointer',
+                            textTransform: 'capitalize'
+                          }}
+                        >
+                          {role}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Standby Configuration */}
+                  {currentRole === 'standby' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', paddingTop: '6px', borderTop: '1px solid #1e293b' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        <label style={{ fontSize: '11px', color: '#c084fc', fontWeight: 600 }}>Watches Primary Transfer</label>
+                        <select
+                          value={selectedLink.primaryLinkId || ''}
+                          onChange={e => {
+                            const nextPrimaryId = e.target.value || undefined;
+                            const nextPrimary = nextPrimaryId ? links.find(l => l.id === nextPrimaryId) : undefined;
+                            if (nextPrimary && nextPrimary.sourceId !== selectedLink.sourceId && !activeTriggers.includes('source')) {
+                              if (onUpdateLinkFields) {
+                                onUpdateLinkFields(selectedLink.id, {
+                                  primaryLinkId: nextPrimaryId,
+                                  diversionTriggers: Array.from(new Set([...activeTriggers, 'source']))
+                                });
+                              } else {
+                                onUpdateLink('primaryLinkId', nextPrimaryId);
+                              }
+                            } else {
+                              onUpdateLink('primaryLinkId', nextPrimaryId);
+                            }
+                          }}
+                          style={{ backgroundColor: '#1e293b', border: '1px solid rgba(168, 85, 247, 0.5)', borderRadius: '4px', color: '#f8fafc', padding: '6px', fontSize: '11px' }}
+                        >
+                          <option value="">-- Select primary link to watch --</option>
+                          {watchablePrimaryLinks.map(l => {
+                            const pSrc = nodes.find(n => n.id === l.sourceId);
+                            const pTgt = nodes.find(n => n.id === l.targetId);
+                            return (
+                              <option key={l.id} value={l.id}>
+                                {pSrc?.name || l.sourceId} → {pTgt?.name || l.targetId} ({Math.round(l.dailyRate).toLocaleString()} m³/d)
+                              </option>
+                            );
+                          })}
+                        </select>
                       </div>
-                    ) : (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', backgroundColor: '#0f172a', padding: '8px', borderRadius: '6px', border: '1px solid #334155', maxHeight: '200px', overflowY: 'auto' }}>
-                        {corridors.map(corridor => {
-                          const isChecked = assignedIds.includes(corridor.id);
-                          const stepNum = stepOrderMap.get(corridor.id);
-                          return (
-                            <label
-                              key={corridor.id}
-                              style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'space-between',
-                                gap: '8px',
-                                padding: '6px 8px',
-                                borderRadius: '4px',
-                                backgroundColor: isChecked ? 'rgba(56, 189, 248, 0.10)' : 'transparent',
-                                border: isChecked ? '1px solid rgba(56, 189, 248, 0.35)' : '1px solid transparent',
-                                cursor: 'pointer',
-                                fontSize: '11px',
-                                color: '#e2e8f0'
-                              }}
-                            >
-                              <span style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                        <span style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600 }}>Spillover Activation Triggers</span>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '4px' }}>
+                          {triggerOptions.map(opt => {
+                            const checked = activeTriggers.includes(opt.key);
+                            return (
+                              <label
+                                key={opt.key}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '7px',
+                                  padding: '4px 6px',
+                                  borderRadius: '4px',
+                                  backgroundColor: checked ? 'rgba(168, 85, 247, 0.12)' : '#1e293b',
+                                  border: checked ? '1px solid rgba(168, 85, 247, 0.4)' : '1px solid #334155',
+                                  fontSize: '10px',
+                                  color: checked ? '#f3e8ff' : '#94a3b8',
+                                  cursor: 'pointer'
+                                }}
+                              >
                                 <input
                                   type="checkbox"
-                                  checked={isChecked}
-                                  onChange={e => onToggleLinkCorridor(selectedLink.id, corridor.id, e.target.checked)}
-                                  style={{ accentColor: '#38bdf8', flexShrink: 0 }}
+                                  checked={checked}
+                                  onChange={e => handleToggleTrigger(opt.key, e.target.checked)}
+                                  style={{ accentColor: '#a855f7', margin: 0 }}
                                 />
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  {corridor.name}
-                                </span>
+                                <span>{opt.label}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.35 }}>
+                        Dormant until the watched primary delivers less than planned due to a selected trigger; then diverts the unmet spillover remainder up to this link&apos;s Daily Rate.
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Overflow Configuration */}
+                  {currentRole === 'overflow' && srcNode && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', paddingTop: '6px', borderTop: '1px solid #1e293b' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ fontSize: '11px', color: '#e9d5ff' }}>
+                          Backup from <strong>{srcNode.name}</strong>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onSelectTargetElement('container', srcNode.id)}
+                          style={{
+                            background: 'none',
+                            border: '1px solid #475569',
+                            borderRadius: '4px',
+                            color: '#38bdf8',
+                            fontSize: '10px',
+                            fontWeight: 600,
+                            padding: '2px 6px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          Inspect Source
+                        </button>
+                      </div>
+                      {srcNode.overflowMode === 'strict' && srcNode.strictSubRule === 'transfer_through' ? (
+                        <div style={{ fontSize: '10px', color: '#d8b4fe', backgroundColor: 'rgba(168, 85, 247, 0.12)', border: '1px solid rgba(168, 85, 247, 0.35)', borderRadius: '4px', padding: '6px 8px', fontVariantNumeric: 'tabular-nums' }}>
+                          Active when <strong>{srcNode.name}</strong> exceeds <strong>{srcNode.overflowTriggerPct ?? 100}%</strong> full ({Math.round(srcNode.capacity * ((srcNode.overflowTriggerPct ?? 100) / 100)).toLocaleString()} m³). Target <strong>{tgtNode?.name || selectedLink.targetId}</strong> drains via its normal outbound links.
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', backgroundColor: 'rgba(245, 158, 11, 0.10)', border: '1px solid rgba(245, 158, 11, 0.4)', borderRadius: '4px', padding: '7px 8px' }}>
+                          <div style={{ fontSize: '10px', color: '#fde68a', lineHeight: 1.35 }}>
+                            Source <strong>{srcNode.name}</strong> is currently set to <strong>{srcNode.overflowMode === 'overfill' ? 'Overfill' : (srcNode.strictSubRule || 'throttleback')}</strong>. Enable Transfer-Through on {srcNode.name} to activate this overflow link.
+                          </div>
+                          {onUpdateNodeById && (
+                            <button
+                              type="button"
+                              onClick={() => onUpdateNodeById(srcNode.id, { overflowMode: 'strict', strictSubRule: 'transfer_through' })}
+                              style={{
+                                backgroundColor: 'rgba(168, 85, 247, 0.25)',
+                                border: '1px solid #a855f7',
+                                borderRadius: '4px',
+                                color: '#f3e8ff',
+                                fontSize: '10px',
+                                fontWeight: 700,
+                                padding: '5px 8px',
+                                cursor: 'pointer'
+                              }}
+                            >
+                              Enable Transfer-Through on {srcNode.name}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Primary link: show watching standbys */}
+                  {currentRole === 'primary' && watchingStandbyLinks.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingTop: '6px', borderTop: '1px solid #1e293b' }}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, color: '#c084fc', textTransform: 'uppercase' }}>
+                        Watched by Standby Links ({watchingStandbyLinks.length})
+                      </span>
+                      {watchingStandbyLinks.map(stby => {
+                        const sSrc = nodes.find(n => n.id === stby.sourceId);
+                        const sTgt = nodes.find(n => n.id === stby.targetId);
+                        return (
+                          <button
+                            key={stby.id}
+                            type="button"
+                            onClick={() => onSelectTargetElement('transfer', stby.id)}
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                              padding: '5px 8px',
+                              backgroundColor: 'rgba(168, 85, 247, 0.10)',
+                              border: '1px solid rgba(168, 85, 247, 0.35)',
+                              borderRadius: '4px',
+                              color: '#e9d5ff',
+                              fontSize: '10px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              P{stby.priority ?? 1}: {sSrc?.name || stby.sourceId} → {sTgt?.name || stby.targetId}
+                            </span>
+                            <span style={{ fontVariantNumeric: 'tabular-nums', flexShrink: 0, marginLeft: '6px' }}>
+                              {Math.round(stby.dailyRate).toLocaleString()} m³/d
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Daily Rate (m³/day)</label>
+                  <input type="number" value={selectedLink.dailyRate} onChange={e => onUpdateLink('dailyRate', Number(e.target.value))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Fleet Count</label>
+                    <input type="number" min={0} value={selectedLink.fleetCount} onChange={e => onUpdateLink('fleetCount', Math.max(0, Number(e.target.value) || 0))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Priority (1 = High)</label>
+                    <input type="number" min={1} max={99} value={selectedLink.priority ?? 1} onChange={e => onUpdateLink('priority', Math.max(1, Math.round(Number(e.target.value) || 1)))} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontVariantNumeric: 'tabular-nums' }} />
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Material Override</label>
+                  <select
+                    value={selectedLink.materialId || ''}
+                    onChange={e => onUpdateLink('materialId', e.target.value || undefined)}
+                    style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
+                  >
+                    <option value="">Default (Inherit Source Material)</option>
+                    {materials.map(mat => (
+                      <option key={mat.code} value={mat.code}>
+                        {mat.code} — {mat.name} (IN: {mat.bulkIN}, OUT: {mat.bulkOUT})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Primary Route Corridors */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Primary Route Corridors</label>
+                    <span style={{ fontSize: '10px', color: assignedIds.length > 0 ? '#38bdf8' : '#64748b', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
+                      {assignedIds.length > 0 ? `${assignedIds.length} active (auto-ordered)` : 'Direct Route'}
+                    </span>
+                  </div>
+                  {corridors.length === 0 ? (
+                    <div style={{ fontSize: '11px', color: '#64748b', backgroundColor: '#0f172a', padding: '10px', borderRadius: '4px', border: '1px solid #334155' }}>
+                      No route corridors in model. Click <strong>+ route</strong> to create one.
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', backgroundColor: '#0f172a', padding: '8px', borderRadius: '6px', border: '1px solid #334155', maxHeight: '160px', overflowY: 'auto' }}>
+                      {corridors.map(corridor => {
+                        const isChecked = assignedIds.includes(corridor.id);
+                        const stepNum = stepOrderMap.get(corridor.id);
+                        return (
+                          <label
+                            key={corridor.id}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              gap: '8px',
+                              padding: '6px 8px',
+                              borderRadius: '4px',
+                              backgroundColor: isChecked ? 'rgba(56, 189, 248, 0.10)' : 'transparent',
+                              border: isChecked ? '1px solid rgba(56, 189, 248, 0.35)' : '1px solid transparent',
+                              cursor: 'pointer',
+                              fontSize: '11px',
+                              color: '#e2e8f0'
+                            }}
+                          >
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={e => onToggleLinkCorridor(selectedLink.id, corridor.id, e.target.checked)}
+                                style={{ accentColor: '#38bdf8', flexShrink: 0 }}
+                              />
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {corridor.name}
                               </span>
-                              <span style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
-                                {stepNum !== undefined && (
-                                  <span style={{ color: '#38bdf8', fontWeight: 700, fontSize: '10px' }}>
-                                    #{stepNum}
-                                  </span>
-                                )}
-                                <span style={{ color: '#64748b', fontSize: '10px' }}>
-                                  {corridor.laneSpacing}px
+                            </span>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
+                              {stepNum !== undefined && (
+                                <span style={{ color: '#38bdf8', fontWeight: 700, fontSize: '10px' }}>
+                                  #{stepNum}
                                 </span>
+                              )}
+                              <span style={{ color: '#64748b', fontSize: '10px' }}>
+                                {corridor.laneSpacing}px
                               </span>
-                            </label>
-                          );
-                        })}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Backup Route Corridors (Spillover Detour) */}
+                {corridors.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', backgroundColor: '#0f172a', padding: '10px', borderRadius: '6px', border: '1px solid #334155' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label style={{ fontSize: '11px', color: '#c084fc', fontWeight: 600 }}>Backup Route Corridors (Detour)</label>
+                      <span style={{ fontSize: '10px', color: backupIds.length > 0 ? '#c084fc' : '#64748b', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
+                        {backupIds.length > 0 ? `${backupIds.length} detour` : 'None'}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', maxHeight: '140px', overflowY: 'auto' }}>
+                      {corridors.map(corridor => {
+                        const isPrimary = assignedIds.includes(corridor.id);
+                        const isBackup = backupIds.includes(corridor.id);
+                        return (
+                          <label
+                            key={corridor.id}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              gap: '8px',
+                              padding: '5px 8px',
+                              borderRadius: '4px',
+                              backgroundColor: isBackup ? 'rgba(168, 85, 247, 0.14)' : 'transparent',
+                              border: isBackup ? '1px solid rgba(168, 85, 247, 0.45)' : '1px solid transparent',
+                              cursor: isPrimary ? 'not-allowed' : 'pointer',
+                              opacity: isPrimary ? 0.45 : 1,
+                              fontSize: '11px',
+                              color: '#e2e8f0'
+                            }}
+                          >
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                              <input
+                                type="checkbox"
+                                checked={isBackup}
+                                disabled={isPrimary}
+                                onChange={e => onToggleLinkBackupCorridor(selectedLink.id, corridor.id, e.target.checked)}
+                                style={{ accentColor: '#a855f7', flexShrink: 0 }}
+                              />
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {corridor.name}
+                              </span>
+                            </span>
+                            {isPrimary && (
+                              <span style={{ fontSize: '9px', color: '#38bdf8', fontWeight: 700, flexShrink: 0 }}>PRIMARY</span>
+                            )}
+                          </label>
+                        );
+                      })}
+                    </div>
+
+                    {backupIds.length > 0 && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingTop: '6px', borderTop: '1px solid #1e293b' }}>
+                        <label style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600 }}>Detour Rate Cap (m³/day, optional)</label>
+                        <input
+                          type="number"
+                          min={0}
+                          step={50}
+                          placeholder={`Full spillover (up to ${Math.round(selectedLink.dailyRate).toLocaleString()} m³/d)`}
+                          value={selectedLink.backupCorridorRate ?? ''}
+                          onChange={e => {
+                            const raw = e.target.value.trim();
+                            onUpdateLink('backupCorridorRate', raw === '' ? undefined : Math.max(0, Number(raw) || 0));
+                          }}
+                          style={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '6px', fontSize: '11px', fontVariantNumeric: 'tabular-nums' }}
+                        />
+                        <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.35 }}>
+                          When a Primary Route is blocked or capped, unmet spillover automatically detours through these backup corridors.
+                        </div>
                       </div>
                     )}
                   </div>
-                );
-              })()}
+                )}
 
-              {/* Transfer Link Notes Section */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
-                  <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                {/* Transfer Link Notes Section */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
+                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                  </div>
+                  <textarea
+                    value={selectedLink.notes || ''}
+                    onChange={e => onUpdateLink('notes', e.target.value)}
+                    placeholder="Transfer route notes, corridor conditions, speed restrictions..."
+                    rows={3}
+                    style={{
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #475569',
+                      borderRadius: '4px',
+                      color: '#f8fafc',
+                      padding: '8px',
+                      fontSize: '12px',
+                      resize: 'vertical',
+                      fontFamily: 'inherit',
+                      lineHeight: 1.4
+                    }}
+                  />
                 </div>
-                <textarea
-                  value={selectedLink.notes || ''}
-                  onChange={e => onUpdateLink('notes', e.target.value)}
-                  placeholder="Transfer route notes, corridor conditions, speed restrictions..."
-                  rows={3}
-                  style={{
-                    backgroundColor: '#0f172a',
-                    border: '1px solid #475569',
-                    borderRadius: '4px',
-                    color: '#f8fafc',
-                    padding: '8px',
-                    fontSize: '12px',
-                    resize: 'vertical',
-                    fontFamily: 'inherit',
-                    lineHeight: 1.4
-                  }}
-                />
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {isPureSingleCorridor && selectedCorridor && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', paddingBottom: '120px' }}>

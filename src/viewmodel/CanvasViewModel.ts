@@ -8,7 +8,8 @@ import {
   CalendarModel,
   CalendarEvent,
   Point,
-  getLinkCorridorIds
+  getLinkCorridorIds,
+  getLinkBackupCorridorIds
 } from '../models/types';
 import { SimEngine, OverflowMode, StrictSubRule } from '../simulation/SimEngine';
 
@@ -213,20 +214,28 @@ export class CanvasViewModel {
     }
     const validNodeIds = new Set(nodes.map(n => n.id));
     this.nodes = nodes;
+    const validCorridorIds = new Set((corridors || []).map(c => c.id));
     this.links = links
       .filter(l => validNodeIds.has(l.sourceId) && validNodeIds.has(l.targetId))
       .map(l => {
-        const ids = getLinkCorridorIds(l);
+        const ids = getLinkCorridorIds(l).filter(cid => validCorridorIds.has(cid));
+        const backupIds = getLinkBackupCorridorIds(l).filter(cid => validCorridorIds.has(cid) && !ids.includes(cid));
         const copy: TransferLink = { ...l };
         delete copy.corridorId;
         if (ids.length > 0) copy.corridorIds = ids;
         else delete copy.corridorIds;
+        if (backupIds.length > 0) copy.backupCorridorIds = backupIds;
+        else delete copy.backupCorridorIds;
         return copy;
       });
     this.corridors = corridors ? corridors.map(c => ({ ...c, waypoints: c.waypoints.map(p => ({ ...p })) })) : [];
 
     const validLinkIds = new Set(this.links.map(l => l.id));
-    const validCorridorIds = new Set(this.corridors.map(c => c.id));
+    this.links.forEach(l => {
+      if (l.primaryLinkId && (!validLinkIds.has(l.primaryLinkId) || l.primaryLinkId === l.id)) {
+        delete l.primaryLinkId;
+      }
+    });
     if (calendar) {
       const calId = calendar.id || 'calendar-1';
       const validEvents = (calendar.events || [])
@@ -312,6 +321,11 @@ export class CanvasViewModel {
     );
     this.nodes = this.nodes.filter(n => n.id !== id);
     this.links = this.links.filter(l => l.sourceId !== id && l.targetId !== id);
+    this.links.forEach(l => {
+      if (l.primaryLinkId && removedLinkIds.has(l.primaryLinkId)) {
+        delete l.primaryLinkId;
+      }
+    });
     this.calendar.events = this.calendar.events.filter(
       evt =>
         !(evt.targetType === 'container' && evt.targetId === id) &&
@@ -327,6 +341,11 @@ export class CanvasViewModel {
 
   public removeLink(id: string): void {
     this.links = this.links.filter(l => l.id !== id);
+    this.links.forEach(l => {
+      if (l.primaryLinkId === id) {
+        delete l.primaryLinkId;
+      }
+    });
     this.calendar.events = this.calendar.events.filter(
       evt => !(evt.targetType === 'transfer' && evt.targetId === id)
     );
@@ -394,6 +413,10 @@ export class CanvasViewModel {
       delete l.corridorId;
       if (nextIds.length > 0) l.corridorIds = nextIds;
       else delete l.corridorIds;
+
+      const nextBackupIds = getLinkBackupCorridorIds(l).filter(cid => cid !== id);
+      if (nextBackupIds.length > 0) l.backupCorridorIds = nextBackupIds;
+      else delete l.backupCorridorIds;
     });
     this.calendar.events = this.calendar.events.filter(
       evt => !(evt.targetType === 'route' && evt.targetId === id)
@@ -452,6 +475,35 @@ export class CanvasViewModel {
     delete link.corridorId;
     if (next.length > 0) link.corridorIds = next;
     else delete link.corridorIds;
+
+    // Prevent same corridor from being both primary and backup simultaneously
+    if (assign && Array.isArray(link.backupCorridorIds)) {
+      const filteredBackups = link.backupCorridorIds.filter(id => id !== corridorId);
+      if (filteredBackups.length > 0) link.backupCorridorIds = filteredBackups;
+      else delete link.backupCorridorIds;
+    }
+    this.recalculateSimulation();
+  }
+
+  public toggleLinkBackupCorridor(linkId: string, corridorId: string, assign: boolean): void {
+    const link = this.links.find(l => l.id === linkId);
+    if (!link) return;
+    const primaryIds = getLinkCorridorIds(link);
+    if (assign && primaryIds.includes(corridorId)) {
+      // Remove from primary if moving to backup
+      const remainingPrimary = primaryIds.filter(id => id !== corridorId);
+      delete link.corridorId;
+      if (remainingPrimary.length > 0) link.corridorIds = remainingPrimary;
+      else delete link.corridorIds;
+    }
+    const current = getLinkBackupCorridorIds(link);
+    const next = assign
+      ? current.includes(corridorId)
+        ? current
+        : [...current, corridorId]
+      : current.filter(id => id !== corridorId);
+    if (next.length > 0) link.backupCorridorIds = next;
+    else delete link.backupCorridorIds;
     this.recalculateSimulation();
   }
 

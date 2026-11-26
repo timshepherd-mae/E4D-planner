@@ -1,8 +1,10 @@
 export type ContainerType = 'excavation' | 'stockpile' | 'null' | 'external';
 export type OverflowMode = 'strict' | 'overfill';
-export type StrictSubRule = 'throttleback' | 'headroom_hold';
+export type StrictSubRule = 'throttleback' | 'headroom_hold' | 'transfer_through';
 export type NodeStatus = 'active' | 'maintenance' | 'blocked';
 export type CardinalEdge = 'N' | 'E' | 'S' | 'W';
+export type LinkRole = 'primary' | 'standby' | 'overflow';
+export type DiversionTrigger = 'route' | 'target' | 'calendar' | 'source';
 
 export interface MaterialDefinition {
   code: string;
@@ -24,6 +26,7 @@ export interface ContainerNode {
   overflowMode?: OverflowMode;
   strictSubRule?: StrictSubRule;
   headroomThreshold?: number; // e.g. 500 m³ spare space required to resume after headroom hold
+  overflowTriggerPct?: number; // 1..100 (% full) at which transfer-through activates (default 100)
   status?: NodeStatus;
   allowedMaterials?: string[];
   outputEdge?: CardinalEdge;
@@ -54,11 +57,21 @@ export interface TransferLink {
   fleetCount: number;
   materialId?: string;
   priority?: number;
+  linkRole?: LinkRole; // 'primary' (default), 'standby' (spillover diversion), 'overflow' (container transfer-through)
+  primaryLinkId?: string; // Watched primary transfer ID when linkRole === 'standby'
+  diversionTriggers?: DiversionTrigger[]; // Qualifying constraints when linkRole === 'standby'
   corridorIds?: string[];
   corridorId?: string; // Legacy single-corridor fallback
+  backupCorridorIds?: string[]; // Detour route corridors used for spillover when primary corridors block/throttle
+  backupCorridorRate?: number; // Optional detour daily rate cap (m³/d)
   rateSchedule?: { day: number; rate: number }[];
   notes?: string;
 }
+
+export const getLinkRole = (link: { linkRole?: LinkRole }): LinkRole => {
+  if (link.linkRole === 'standby' || link.linkRole === 'overflow') return link.linkRole;
+  return 'primary';
+};
 
 export const getLinkCorridorIds = (link: { corridorIds?: string[]; corridorId?: string }): string[] => {
   const seen = new Set<string>();
@@ -78,7 +91,26 @@ export const getLinkCorridorIds = (link: { corridorIds?: string[]; corridorId?: 
   return result;
 };
 
-export type FlowStatus = 'frozen' | 'starved' | 'full' | 'restricted' | 'blocked' | 'idle';
+export const getLinkBackupCorridorIds = (link: {
+  corridorIds?: string[];
+  corridorId?: string;
+  backupCorridorIds?: string[];
+}): string[] => {
+  const primarySet = new Set(getLinkCorridorIds(link));
+  const seen = new Set<string>();
+  const result: string[] = [];
+  if (Array.isArray(link.backupCorridorIds)) {
+    link.backupCorridorIds.forEach(id => {
+      if (id && !primarySet.has(id) && !seen.has(id)) {
+        seen.add(id);
+        result.push(id);
+      }
+    });
+  }
+  return result;
+};
+
+export type FlowStatus = 'frozen' | 'starved' | 'full' | 'restricted' | 'blocked' | 'diverted' | 'idle';
 
 export type CalendarTargetType = 'container' | 'transfer' | 'route';
 export type ContainerEventState = 'open' | 'restricted' | 'blocked';
@@ -106,11 +138,21 @@ export interface CalendarModel {
   events: CalendarEvent[];
 }
 
+export interface LinkRouteSplit {
+  primaryFlow: number;
+  backupFlow: number;
+  activeBackupCorridorIds: string[];
+}
+
 export interface SimFrame {
   day: number;
   nodeVolumes: Record<string, number>;
   linkFlows: Record<string, number>;
   corridorFlows?: Record<string, number>;
+  backupCorridorFlows?: Record<string, number>;
+  linkRouteSplits?: Record<string, LinkRouteSplit>;
+  overflowActiveNodes?: Record<string, number>;
+  standbyActivatedFrom?: Record<string, { primaryLinkId: string; divertedFlow: number }>;
   linkStatuses: Record<string, FlowStatus>;
   nodeStatuses: Record<string, FlowStatus>;
   corridorStatuses?: Record<string, FlowStatus>;
@@ -126,6 +168,7 @@ export interface ContainerProperties {
   overflowMode?: OverflowMode;
   strictSubRule?: StrictSubRule;
   headroomThreshold?: number;
+  overflowTriggerPct?: number;
   status?: NodeStatus;
   allowedMaterials?: string[];
   outputEdge?: CardinalEdge;
@@ -138,8 +181,12 @@ export interface LinkProperties {
   fleetCount: number;
   materialId?: string;
   priority?: number;
+  linkRole?: LinkRole;
+  diversionTriggers?: DiversionTrigger[];
   corridorIds?: string[];
   corridorId?: string;
+  backupCorridorIds?: string[];
+  backupCorridorRate?: number;
   rateSchedule?: { day: number; rate: number }[];
   notes?: string;
 }

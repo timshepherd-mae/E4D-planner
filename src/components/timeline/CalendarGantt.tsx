@@ -7,6 +7,7 @@ import {
   CalendarEvent,
   CalendarTargetType,
   GRAPH_LINE_COLORS,
+  getLinkRole,
   getLinkCorridorIds
 } from '../../models/types';
 
@@ -1144,13 +1145,16 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
         links.map(link => {
           const srcName = nodeMap.get(link.sourceId)?.node.name || link.sourceId;
           const tgtName = nodeMap.get(link.targetId)?.node.name || link.targetId;
-          const label = `${srcName} → ${tgtName}`;
+          const role = getLinkRole(link);
+          const prefix = role === 'standby' ? '[STBY] ' : role === 'overflow' ? '[OVF] ' : '';
+          const label = `${prefix}${srcName} → ${tgtName}`;
+          const accent = role === 'primary' ? '#38bdf8' : '#a855f7';
           return renderRow(
             'transfer',
             link.id,
             label,
             formatCompactRate(link.dailyRate),
-            '#38bdf8',
+            accent,
             selectedLinkIds.includes(link.id)
           );
         })}

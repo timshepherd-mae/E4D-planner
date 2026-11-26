@@ -48,7 +48,7 @@ export const BatchPresetBar: React.FC<BatchPresetBarProps> = ({ onApplyPreset, s
         <button
           onClick={() => onApplyPreset('strict', 'headroom_hold')}
           style={{
-            width: '170px',
+            width: '150px',
             height: '30px',
             backgroundColor: '#1e293b',
             color: '#f8fafc',
@@ -61,7 +61,8 @@ export const BatchPresetBar: React.FC<BatchPresetBarProps> = ({ onApplyPreset, s
             alignItems: 'center',
             justifyContent: 'center',
             gap: '8px',
-            boxSizing: 'border-box'
+            boxSizing: 'border-box',
+            whiteSpace: 'nowrap'
           }}
           title="Strict Capacity (Headroom Hold)"
         >
@@ -72,9 +73,9 @@ export const BatchPresetBar: React.FC<BatchPresetBarProps> = ({ onApplyPreset, s
         </button>
 
         <button
-          onClick={() => onApplyPreset('overfill')}
+          onClick={() => onApplyPreset('strict', 'transfer_through')}
           style={{
-            width: '170px',
+            width: '160px',
             height: '30px',
             backgroundColor: '#1e293b',
             color: '#f8fafc',
@@ -87,7 +88,35 @@ export const BatchPresetBar: React.FC<BatchPresetBarProps> = ({ onApplyPreset, s
             alignItems: 'center',
             justifyContent: 'center',
             gap: '8px',
-            boxSizing: 'border-box'
+            boxSizing: 'border-box',
+            whiteSpace: 'nowrap'
+          }}
+          title="Strict Capacity (Transfer-Through to Backup Container)"
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13" style={{ display: 'inline-block', flexShrink: 0 }}>
+            <polygon points="6.5,1 12.5,11.5 0.5,11.5" fill="#e9d5ff" stroke="#0f172a" strokeWidth="1.2" />
+          </svg>
+          <span>Transfer-Through</span>
+        </button>
+
+        <button
+          onClick={() => onApplyPreset('overfill')}
+          style={{
+            width: '130px',
+            height: '30px',
+            backgroundColor: '#1e293b',
+            color: '#f8fafc',
+            border: '1px solid #475569',
+            borderRadius: '6px',
+            fontSize: '12px',
+            fontWeight: 600,
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '8px',
+            boxSizing: 'border-box',
+            whiteSpace: 'nowrap'
           }}
           title="Uncapped Capacity (Allow Overfill)"
         >

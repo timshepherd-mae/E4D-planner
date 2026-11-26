@@ -1,5 +1,15 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { ContainerNode, TransferLink, RouteCorridor, SimFrame, FlowStatus, GRAPH_LINE_COLORS, getLinkCorridorIds } from '../../models/types';
+import {
+  ContainerNode,
+  TransferLink,
+  RouteCorridor,
+  SimFrame,
+  FlowStatus,
+  GRAPH_LINE_COLORS,
+  getLinkRole,
+  getLinkCorridorIds,
+  getLinkBackupCorridorIds
+} from '../../models/types';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
 import { initPipeRouter, isPipeRouterReady, computeAllLinkRoutes, getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge } from './pipeRouter';
 
@@ -11,8 +21,12 @@ export const getFlowColor = (status: FlowStatus = 'frozen'): string => {
       return '#22c55e'; // Green: flowing at full rate
     case 'restricted':
       return '#f59e0b'; // Amber: flowing at restricted rate
+    case 'diverted':
+      return '#a855f7'; // Violet: active diversion / detour / container transfer-through
     case 'blocked':
-      return '#ef4444'; // Red: blocked from sending/receiving due to capacity issues
+      return '#ef4444'; // Red: blocked from sending/receiving due to capacity/schedule issues
+    case 'idle':
+      return '#64748b'; // Muted Slate: dormant standby / overflow link
     case 'starved':
     case 'frozen':
     default:
@@ -223,12 +237,13 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
     };
   };
 
-  const getCorridorRateMeta = (corridorId: string): { text: string; status: FlowStatus } => {
+  const getCorridorRateMeta = (corridorId: string): { text: string; status: FlowStatus; hasDetour: boolean } => {
     const sharedLinks = links.filter((l) => getLinkCorridorIds(l).includes(corridorId));
-    const combinedRate = sharedLinks.reduce((sum, l) => {
-      const rate = isPlayback ? (currentFrame?.linkFlows[l.id] ?? 0) : l.dailyRate;
-      return sum + (Number.isFinite(rate) ? rate : 0);
-    }, 0);
+    const combinedRate = isPlayback
+      ? (currentFrame?.corridorFlows?.[corridorId] ??
+          sharedLinks.reduce((sum, l) => sum + (currentFrame?.linkFlows[l.id] ?? 0), 0))
+      : sharedLinks.reduce((sum, l) => sum + (Number.isFinite(l.dailyRate) ? l.dailyRate : 0), 0);
+    const detourFlow = isPlayback ? (currentFrame?.backupCorridorFlows?.[corridorId] ?? 0) : 0;
 
     let status: FlowStatus = 'frozen';
     if (isPlayback) {
@@ -239,6 +254,7 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         const statuses = sharedLinks.map((l) => currentFrame?.linkStatuses?.[l.id] ?? 'frozen');
         if (statuses.includes('blocked')) status = 'blocked';
         else if (statuses.includes('restricted')) status = 'restricted';
+        else if (statuses.includes('diverted')) status = 'diverted';
         else if (statuses.includes('full')) status = 'full';
         else if (statuses.includes('starved')) status = 'starved';
       }
@@ -246,7 +262,8 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
 
     return {
       text: (combinedRate / 1000).toFixed(2),
-      status
+      status,
+      hasDetour: detourFlow > 1e-6
     };
   };
 
@@ -668,10 +685,14 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
 
       // 2.5 Draw Route Corridors (underneath pipes and containers)
       const assignedCorridorCounts = new Map<string, number>();
+      const selectedBackupCorridorSet = new Set<string>();
       links.forEach((l) => {
         getLinkCorridorIds(l).forEach((cid) => {
           assignedCorridorCounts.set(cid, (assignedCorridorCounts.get(cid) || 0) + 1);
         });
+        if (!isPlayback && selectedLinkIds.includes(l.id)) {
+          getLinkBackupCorridorIds(l).forEach((cid) => selectedBackupCorridorSet.add(cid));
+        }
       });
 
       corridors.forEach((corridor) => {
@@ -679,6 +700,8 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         if (!wps || wps.length < 2) return;
 
         const isSelected = selectedCorridorIds.includes(corridor.id);
+        const isBackupPreview = !isPlayback && selectedBackupCorridorSet.has(corridor.id);
+        const isActiveDetourCorridor = isPlayback && (currentFrame?.backupCorridorFlows?.[corridor.id] ?? 0) > 1e-6;
         const assignedCount = assignedCorridorCounts.get(corridor.id) || 0;
         const bandWidth = getCorridorBandWidth(corridor, assignedCount);
 
@@ -686,7 +709,11 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         ctx.save();
         ctx.lineCap = 'butt';
         ctx.lineJoin = 'round';
-        ctx.strokeStyle = isSelected ? 'rgba(56, 189, 248, 0.28)' : 'rgba(203, 213, 225, 0.20)';
+        ctx.strokeStyle = isSelected
+          ? 'rgba(56, 189, 248, 0.28)'
+          : isActiveDetourCorridor || isBackupPreview
+          ? 'rgba(168, 85, 247, 0.24)'
+          : 'rgba(203, 213, 225, 0.20)';
         ctx.lineWidth = bandWidth;
         ctx.beginPath();
         ctx.moveTo(wps[0].x, wps[0].y);
@@ -695,17 +722,39 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         }
         ctx.stroke();
 
+        // Subtle dashed violet centerline preview when showing backup corridor assignment or active detour
+        if (isBackupPreview || isActiveDetourCorridor) {
+          ctx.strokeStyle = isActiveDetourCorridor ? '#a855f7' : 'rgba(192, 132, 252, 0.75)';
+          ctx.lineWidth = isActiveDetourCorridor ? 2.5 : 1.75;
+          ctx.setLineDash([8, 6]);
+          ctx.beginPath();
+          ctx.moveTo(wps[0].x, wps[0].y);
+          for (let i = 1; i < wps.length; i++) {
+            ctx.lineTo(wps[i].x, wps[i].y);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
         // Selectable route label aligned to longest segment
         const labelBox = getCorridorLabelBox(corridor, bandWidth, ctx);
         if (labelBox && corridor.name) {
           ctx.save();
           ctx.translate(labelBox.midX, labelBox.midY);
           ctx.rotate(labelBox.angle);
-          ctx.fillStyle = isSelected ? '#38bdf8' : '#cbd5e1';
+          ctx.fillStyle = isSelected
+            ? '#38bdf8'
+            : isActiveDetourCorridor || isBackupPreview
+            ? '#d8b4fe'
+            : '#cbd5e1';
           ctx.font = '600 10px system-ui, sans-serif';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          ctx.fillText(corridor.name, 0, 0);
+          ctx.fillText(
+            isActiveDetourCorridor ? `${corridor.name} · DETOUR` : corridor.name,
+            0,
+            0
+          );
           ctx.restore();
         }
         ctx.restore();
@@ -719,14 +768,35 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         if (!route || route.points.length < 2) return;
 
         const points = route.points;
+        const role = getLinkRole(link);
         const isSelected = selectedLinkIds.includes(link.id);
         const linkFlow = isPlayback ? (currentFrame?.linkFlows[link.id] ?? 0) : link.dailyRate;
         const linkStatus: FlowStatus = isPlayback ? (currentFrame?.linkStatuses?.[link.id] ?? 'frozen') : 'frozen';
+        const routeSplit = isPlayback ? currentFrame?.linkRouteSplits?.[link.id] : undefined;
+        const hasActiveDetour = Boolean(routeSplit && routeSplit.backupFlow > 1e-6);
 
-        const linkColor = isPlayback ? getFlowColor(linkStatus) : (isSelected ? '#38bdf8' : '#64748b');
+        const linkColor = isPlayback
+          ? getFlowColor(linkStatus)
+          : isSelected
+          ? '#38bdf8'
+          : role === 'standby'
+          ? '#a855f7'
+          : role === 'overflow'
+          ? '#c084fc'
+          : '#64748b';
         ctx.strokeStyle = linkColor;
-        ctx.lineWidth = isSelected ? (isPlayback ? 5 : 4) : (isPlayback ? 3.5 : 2.5);
-        ctx.setLineDash([]);
+        ctx.lineWidth = isSelected
+          ? (isPlayback ? 5 : 4)
+          : isPlayback
+          ? (linkStatus === 'idle' ? 2 : 3.5)
+          : 2.5;
+        if (role === 'standby') {
+          ctx.setLineDash([8, 6]);
+        } else if (role === 'overflow') {
+          ctx.setLineDash([4, 4]);
+        } else {
+          ctx.setLineDash([]);
+        }
 
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
@@ -734,6 +804,7 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
           ctx.lineTo(points[i].x, points[i].y);
         }
         ctx.stroke();
+        ctx.setLineDash([]);
 
         const startArrowOffset = 36;
         const p0 = points[0];
@@ -755,12 +826,24 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
           drawArrowHead(ctx, pEnd.x - Math.cos(angleEnd) * dist, pEnd.y - Math.sin(angleEnd) * dist, angleEnd, linkColor);
         }
 
-        // Draw Rate Badge at computed unshared branch position
+        // Draw Rate Badge at computed unshared branch position (with explicit role/diversion text tag)
         const badgePt = route.badgePt;
+        const roleTag =
+          role === 'standby'
+            ? isPlayback && linkStatus === 'diverted'
+              ? 'DIVERTED'
+              : 'STBY'
+            : role === 'overflow'
+            ? isPlayback && linkStatus === 'diverted'
+              ? 'OVERFLOW'
+              : 'OVF'
+            : hasActiveDetour
+            ? 'DETOUR'
+            : '';
 
         const displayRateText = (linkFlow / 1000).toFixed(2);
-        const badgeW = 50;
-        const badgeH = 20;
+        const badgeW = roleTag.length >= 6 ? 58 : 50;
+        const badgeH = roleTag ? 28 : 20;
         ctx.fillStyle = isSelected ? '#0369a1' : '#0f172a';
         ctx.fillRect(badgePt.x - badgeW / 2, badgePt.y - badgeH / 2, badgeW, badgeH);
         ctx.strokeStyle = linkColor;
@@ -771,7 +854,14 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
         ctx.font = 'bold 11px system-ui, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(displayRateText, badgePt.x, badgePt.y + 1.5);
+        if (roleTag) {
+          ctx.fillText(displayRateText, badgePt.x, badgePt.y - 4);
+          ctx.fillStyle = isPlayback && linkStatus === 'diverted' ? '#e9d5ff' : '#c4b5fd';
+          ctx.font = '700 8px system-ui, sans-serif';
+          ctx.fillText(roleTag, badgePt.x, badgePt.y + 7.5);
+        } else {
+          ctx.fillText(displayRateText, badgePt.x, badgePt.y + 1.5);
+        }
       });
 
       // 3.5 Draw Always-Upright Route Corridor Combined-Rate Badges (opposite side of route label)
@@ -900,6 +990,16 @@ export const SimulationCanvas: React.FC<SimulationCanvasProps> = ({
           ctx.lineTo(badgeX + r, badgeY);
           ctx.lineTo(badgeX, badgeY + r);
           ctx.lineTo(badgeX - r, badgeY);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        } else if (node.strictSubRule === 'transfer_through') {
+          const r = 7.5;
+          ctx.fillStyle = '#e9d5ff';
+          ctx.beginPath();
+          ctx.moveTo(badgeX, badgeY - r);
+          ctx.lineTo(badgeX + r, badgeY + r * 0.8);
+          ctx.lineTo(badgeX - r, badgeY + r * 0.8);
           ctx.closePath();
           ctx.fill();
           ctx.stroke();

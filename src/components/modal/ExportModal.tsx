@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ContainerNode, TransferLink, RouteCorridor, CalendarModel, SimFrame, MaterialDefinition, FlowStatus, getLinkCorridorIds } from '../../models/types';
+import { ContainerNode, TransferLink, RouteCorridor, CalendarModel, SimFrame, MaterialDefinition, FlowStatus, getLinkCorridorIds, getLinkBackupCorridorIds, getLinkRole } from '../../models/types';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -35,12 +35,26 @@ export const getStatusMeta = (status: FlowStatus = 'frozen', day: number = 0) =>
         colour: 'Red',
         hex: '#ef4444'
       };
+    case 'diverted':
+      return {
+        state: 'diverted',
+        label: 'Diverted / Detour / Transfer-Through active',
+        colour: 'Violet',
+        hex: '#a855f7'
+      };
     case 'starved':
       return {
         state: 'starved',
         label: 'Cannot deliver due to lack of material',
         colour: 'Blue',
         hex: '#38bdf8'
+      };
+    case 'idle':
+      return {
+        state: 'idle',
+        label: 'Standby / Overflow (Dormant)',
+        colour: 'Slate',
+        hex: '#64748b'
       };
     case 'frozen':
     default:
@@ -82,7 +96,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     lines.push(`# Material Transfer Simulation Comprehensive Model & Diagnostics Export`);
     lines.push(`# Exported: ${timestamp}`);
     lines.push(`# Scope: ${exportScope}`);
-    lines.push(`# Color Key: Blue (#38bdf8) = Day 0 / Starved (lack of material), Green (#22c55e) = Full rate, Amber (#f59e0b) = Restricted rate, Red (#ef4444) = Blocked (capacity)`);
+    lines.push(`# Color Key: Blue (#38bdf8) = Day 0 / Starved (lack of material), Green (#22c55e) = Full rate, Violet (#a855f7) = Diverted / Detour / Transfer-Through, Amber (#f59e0b) = Restricted rate, Red (#ef4444) = Blocked (capacity), Slate (#64748b) = Standby / Overflow (dormant)`);
     lines.push('');
 
     // Model configuration (materials, nodes and links)
@@ -98,7 +112,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       // 2. Container nodes with all properties
       lines.push('# SECTION: INITIAL MODEL NODES');
-      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge,InputEdge,AllowedMaterials');
+      lines.push('NodeID,Name,Type,X,Y,Capacity,InitialVolume,MaterialType,PlantCount,OverflowMode,StrictSubRule,HeadroomThreshold,Status,InitialSimState,InitialColour,InitialColourHex,Notes,OutputEdge,InputEdge,AllowedMaterials,OverflowTriggerPct');
       const day0Frame = frames[0];
       nodes.forEach(n => {
         const escapedName = `"${(n.name || '').replace(/"/g, '""')}"`;
@@ -115,7 +129,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         const allowedMats = n.allowedMaterials && n.allowedMaterials.length > 0
           ? `"${n.allowedMaterials.join('|').replace(/"/g, '""')}"`
           : '""';
-        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge},${inputEdge},${allowedMats}`);
+        const overflowTriggerPct = n.overflowTriggerPct !== undefined ? `${n.overflowTriggerPct}` : '';
+        lines.push(`${n.id},${escapedName},${n.type},${n.x},${n.y},${n.capacity},${n.currentVolume},${escapedMaterial},${n.plantCount},${overflow},${strictSub},${headroom},${status},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${outputEdge},${inputEdge},${allowedMats},${overflowTriggerPct}`);
       });
       lines.push('');
 
@@ -134,7 +149,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       // 4. Transfer pipelines / links
       lines.push('# SECTION: INITIAL MODEL LINKS');
-      lines.push('LinkId,SourceId,TargetId,DailyRate,FleetCount,Priority,MaterialId,InitialSimState,InitialColour,InitialColourHex,Notes,CorridorId');
+      lines.push('LinkId,SourceId,TargetId,DailyRate,FleetCount,Priority,MaterialId,InitialSimState,InitialColour,InitialColourHex,Notes,CorridorId,LinkRole,PrimaryLinkId,DiversionTriggers,BackupCorridorIds,BackupCorridorRate');
       links.forEach(l => {
         const priority = l.priority ?? 1;
         const matId = l.materialId ? `"${l.materialId.replace(/"/g, '""')}"` : '""';
@@ -143,7 +158,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         const escapedNotes = `"${(l.notes || '').replace(/"/g, '""')}"`;
         const linkCorridorIds = getLinkCorridorIds(l);
         const corridorIdVal = linkCorridorIds.length > 0 ? `"${linkCorridorIds.join('|').replace(/"/g, '""')}"` : '""';
-        lines.push(`${l.id},${l.sourceId},${l.targetId},${l.dailyRate},${l.fleetCount},${priority},${matId},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${corridorIdVal}`);
+        const linkRole = getLinkRole(l);
+        const primaryLinkId = l.primaryLinkId ? `"${l.primaryLinkId.replace(/"/g, '""')}"` : '""';
+        const triggersVal = l.diversionTriggers && l.diversionTriggers.length > 0
+          ? `"${l.diversionTriggers.join('|')}"`
+          : '""';
+        const backupCorridorIds = getLinkBackupCorridorIds(l);
+        const backupCorridorVal = backupCorridorIds.length > 0
+          ? `"${backupCorridorIds.join('|').replace(/"/g, '""')}"`
+          : '""';
+        const backupRateVal = l.backupCorridorRate !== undefined && Number.isFinite(l.backupCorridorRate)
+          ? `${l.backupCorridorRate}`
+          : '';
+        lines.push(`${l.id},${l.sourceId},${l.targetId},${l.dailyRate},${l.fleetCount},${priority},${matId},${meta.state},${meta.colour},${meta.hex},${escapedNotes},${corridorIdVal},${linkRole},${primaryLinkId},${triggersVal},${backupCorridorVal},${backupRateVal}`);
       });
       lines.push('');
 
@@ -172,7 +199,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     if (exportScope === 'all' || exportScope === 'telemetry') {
       // 4. Daily Container Records with SimState, Colour, ColourHex, and StateDescription
       lines.push('# SECTION: SIMULATION DAILY NODE VOLUMES');
-      lines.push('Day,NodeID,NodeName,NodeType,MaterialType,BulkIN,BulkOUT,OverflowMode,StrictSubRule,Volume_m3,Capacity_m3,Utilization_pct,SimState,Colour,ColourHex,StateDescription');
+      lines.push('Day,NodeID,NodeName,NodeType,MaterialType,BulkIN,BulkOUT,OverflowMode,StrictSubRule,Volume_m3,Capacity_m3,Utilization_pct,OverflowOut_m3,SimState,Colour,ColourHex,StateDescription');
       frames.forEach(frame => {
         Object.entries(frame.nodeVolumes || {}).forEach(([nodeId, volume]) => {
           const node = nodeMap.get(nodeId);
@@ -186,21 +213,23 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const strictSub = node ? (node.strictSubRule || 'throttleback') : 'throttleback';
           const cap = node ? node.capacity : 0;
           const pct = cap > 0 ? ((volume / cap) * 100).toFixed(1) : '0.0';
+          const overflowOut = Math.round(frame.overflowActiveNodes?.[nodeId] ?? 0);
 
           const nodeStatus: FlowStatus = frame.nodeStatuses?.[nodeId] ?? (frame.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(nodeStatus, frame.day);
 
-          lines.push(`${frame.day},${nodeId},${name},${type},"${matCode}",${bulkIn},${bulkOut},${overflow},${strictSub},${Math.round(volume)},${cap},${pct}%,${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+          lines.push(`${frame.day},${nodeId},${name},${type},"${matCode}",${bulkIn},${bulkOut},${overflow},${strictSub},${Math.round(volume)},${cap},${pct}%,${overflowOut},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
         });
       });
       lines.push('');
 
       // 5. Daily Transfer Records with SimState, Colour, ColourHex, and StateDescription
       lines.push('# SECTION: SIMULATION DAILY LINK FLOWS');
-      lines.push('Day,LinkID,SourceNodeID,SourceName,TargetNodeID,TargetName,PlannedRate_m3d,Transferred_m3,SimState,Colour,ColourHex,StateDescription');
+      lines.push('Day,LinkID,LinkRole,SourceNodeID,SourceName,TargetNodeID,TargetName,PlannedRate_m3d,Transferred_m3,PrimaryRouteFlow_m3,DetourRouteFlow_m3,SimState,Colour,ColourHex,StateDescription');
       frames.forEach(frame => {
         Object.entries(frame.linkFlows || {}).forEach(([linkId, flow]) => {
           const link = linkMap.get(linkId);
+          const linkRole = link ? getLinkRole(link) : 'primary';
           const src = link ? link.sourceId : '';
           const tgt = link ? link.targetId : '';
           const srcNode = nodeMap.get(src);
@@ -208,19 +237,22 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const srcName = srcNode ? `"${srcNode.name.replace(/"/g, '""')}"` : src;
           const tgtName = tgtNode ? `"${tgtNode.name.replace(/"/g, '""')}"` : tgt;
           const plannedRate = link ? link.dailyRate : 0;
+          const split = frame.linkRouteSplits?.[linkId];
+          const primaryFlow = split ? Math.round(split.primaryFlow) : Math.round(flow);
+          const detourFlow = split ? Math.round(split.backupFlow) : 0;
 
           const linkStatus: FlowStatus = frame.linkStatuses?.[linkId] ?? (frame.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(linkStatus, frame.day);
 
-          lines.push(`${frame.day},${linkId},${src},${srcName},${tgt},${tgtName},${plannedRate},${Math.round(flow)},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+          lines.push(`${frame.day},${linkId},${linkRole},${src},${srcName},${tgt},${tgtName},${plannedRate},${Math.round(flow)},${primaryFlow},${detourFlow},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
         });
       });
       lines.push('');
 
-      // 5b. Daily Route Corridor Records with combined flows, caps, and simulation status
+      // 5b. Daily Route Corridor Records with combined flows, detour flows, caps, and simulation status
       if (corridors.length > 0) {
         lines.push('# SECTION: SIMULATION DAILY CORRIDOR FLOWS');
-        lines.push('Day,CorridorID,CorridorName,AssignedLinkCount,PlannedCombined_m3d,ActualFlow_m3,BaselineRateCap_m3d,BaselineFleetCap,SimState,Colour,ColourHex,StateDescription');
+        lines.push('Day,CorridorID,CorridorName,AssignedLinkCount,PlannedCombined_m3d,ActualFlow_m3,DetourFlow_m3,BaselineRateCap_m3d,BaselineFleetCap,SimState,Colour,ColourHex,StateDescription');
         frames.forEach(frame => {
           corridors.forEach(c => {
             const assignedLinks = links.filter(l => getLinkCorridorIds(l).includes(c.id));
@@ -228,12 +260,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             const actualFlow =
               frame.corridorFlows?.[c.id] ??
               assignedLinks.reduce((sum, l) => sum + (frame.linkFlows?.[l.id] ?? 0), 0);
+            const detourFlow = Math.round(frame.backupCorridorFlows?.[c.id] ?? 0);
             const corridorStatus: FlowStatus = frame.corridorStatuses?.[c.id] ?? (frame.day === 0 ? 'frozen' : 'idle');
             const meta = getStatusMeta(corridorStatus, frame.day);
             const escapedName = `"${(c.name || c.id).replace(/"/g, '""')}"`;
             const baseCap = c.maxDailyRate !== undefined && Number.isFinite(c.maxDailyRate) ? `${c.maxDailyRate}` : '';
             const baseFleet = c.maxFleetCount !== undefined && Number.isFinite(c.maxFleetCount) ? `${c.maxFleetCount}` : '';
-            lines.push(`${frame.day},${c.id},${escapedName},${assignedLinks.length},${Math.round(plannedCombined)},${Math.round(actualFlow)},${baseCap},${baseFleet},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+            lines.push(`${frame.day},${c.id},${escapedName},${assignedLinks.length},${Math.round(plannedCombined)},${Math.round(actualFlow)},${detourFlow},${baseCap},${baseFleet},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
           });
         });
         lines.push('');
@@ -304,8 +337,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         colorKey: {
           blue: { colour: 'Blue', hex: '#38bdf8', meaning: 'Day 0 (frozen) + any time a container cannot deliver due to lack of material' },
           green: { colour: 'Green', hex: '#22c55e', meaning: 'Flowing at full rate' },
+          violet: { colour: 'Violet', hex: '#a855f7', meaning: 'Active standby diversion, backup route detour, or container transfer-through' },
           amber: { colour: 'Amber', hex: '#f59e0b', meaning: 'Flowing at restricted rate (downstream capacity throttleback)' },
-          red: { colour: 'Red', hex: '#ef4444', meaning: 'Blocked from sending/receiving due to capacity issues or calendar restriction' }
+          red: { colour: 'Red', hex: '#ef4444', meaning: 'Blocked from sending/receiving due to capacity issues or calendar restriction' },
+          slate: { colour: 'Slate', hex: '#64748b', meaning: 'Dormant standby or overflow link' }
         }
       }
     };
@@ -323,6 +358,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         overflowMode: n.overflowMode || 'strict',
         strictSubRule: n.strictSubRule || 'throttleback',
         headroomThreshold: n.headroomThreshold ?? 500,
+        ...(n.overflowTriggerPct !== undefined ? { overflowTriggerPct: n.overflowTriggerPct } : {}),
         status: n.status || 'active',
         ...(n.allowedMaterials && n.allowedMaterials.length > 0 ? { allowedMaterials: [...n.allowedMaterials] } : {}),
         outputEdge: n.outputEdge || '',
@@ -337,16 +373,24 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         ...(c.maxFleetCount !== undefined ? { maxFleetCount: c.maxFleetCount } : {}),
         notes: c.notes || ''
       }));
-      payload.links = links.map(l => ({
-        id: l.id,
-        sourceId: l.sourceId,
-        targetId: l.targetId,
-        dailyRate: l.dailyRate,
-        fleetCount: l.fleetCount,
-        priority: l.priority ?? 1,
-        materialId: l.materialId || '',
-        corridorIds: getLinkCorridorIds(l)
-      }));
+      payload.links = links.map(l => {
+        const backupCorridorIds = getLinkBackupCorridorIds(l);
+        return {
+          id: l.id,
+          sourceId: l.sourceId,
+          targetId: l.targetId,
+          dailyRate: l.dailyRate,
+          fleetCount: l.fleetCount,
+          priority: l.priority ?? 1,
+          materialId: l.materialId || '',
+          corridorIds: getLinkCorridorIds(l),
+          linkRole: getLinkRole(l),
+          ...(l.primaryLinkId ? { primaryLinkId: l.primaryLinkId } : {}),
+          ...(l.diversionTriggers && l.diversionTriggers.length > 0 ? { diversionTriggers: [...l.diversionTriggers] } : {}),
+          ...(backupCorridorIds.length > 0 ? { backupCorridorIds } : {}),
+          ...(l.backupCorridorRate !== undefined ? { backupCorridorRate: l.backupCorridorRate } : {})
+        };
+      });
       const cal: CalendarModel = calendar || { id: 'calendar-1', name: 'Project Schedule', events: [] };
       payload.calendar = {
         id: cal.id,
@@ -383,6 +427,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             utilization_pct: node && node.capacity > 0 ? Number(((volume / node.capacity) * 100).toFixed(1)) : 0,
             overflowMode: node?.overflowMode || 'strict',
             strictSubRule: node?.strictSubRule || 'throttleback',
+            overflowOut_m3: Math.round(f.overflowActiveNodes?.[nodeId] ?? 0),
             simState: meta.state,
             colour: meta.colour,
             colourHex: meta.hex,
@@ -396,14 +441,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const tgtNode = link ? nodeMap.get(link.targetId) : undefined;
           const linkStatus: FlowStatus = f.linkStatuses?.[linkId] ?? (f.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(linkStatus, f.day);
+          const split = f.linkRouteSplits?.[linkId];
           return {
             linkId,
+            linkRole: link ? getLinkRole(link) : 'primary',
             sourceId: link?.sourceId ?? '',
             sourceName: srcNode?.name ?? link?.sourceId ?? '',
             targetId: link?.targetId ?? '',
             targetName: tgtNode?.name ?? link?.targetId ?? '',
             plannedRate_m3d: link?.dailyRate ?? 0,
             transferred_m3: Math.round(flow),
+            primaryRouteFlow_m3: split ? Math.round(split.primaryFlow) : Math.round(flow),
+            detourRouteFlow_m3: split ? Math.round(split.backupFlow) : 0,
+            ...(f.standbyActivatedFrom?.[linkId] ? { standbyActivatedFrom: f.standbyActivatedFrom[linkId] } : {}),
             simState: meta.state,
             colour: meta.colour,
             colourHex: meta.hex,
@@ -417,6 +467,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const actualFlow =
             f.corridorFlows?.[c.id] ??
             assignedLinks.reduce((sum, l) => sum + (f.linkFlows?.[l.id] ?? 0), 0);
+          const detourFlow = Math.round(f.backupCorridorFlows?.[c.id] ?? 0);
           const corridorStatus: FlowStatus = f.corridorStatuses?.[c.id] ?? (f.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(corridorStatus, f.day);
           return {
@@ -425,6 +476,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             assignedLinkCount: assignedLinks.length,
             plannedCombined_m3d: Math.round(plannedCombined),
             actualFlow_m3: Math.round(actualFlow),
+            detourFlow_m3: detourFlow,
             ...(c.maxDailyRate !== undefined ? { baselineRateCap_m3d: c.maxDailyRate } : {}),
             ...(c.maxFleetCount !== undefined ? { baselineFleetCap: c.maxFleetCount } : {}),
             simState: meta.state,
