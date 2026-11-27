@@ -112,21 +112,26 @@ export const getLinkBackupCorridorIds = (link: {
 
 export type FlowStatus = 'frozen' | 'starved' | 'full' | 'restricted' | 'blocked' | 'diverted' | 'idle';
 
-export type CalendarTargetType = 'container' | 'transfer' | 'route';
+export type CalendarTargetType = 'global' | 'container' | 'transfer' | 'route';
+export type GlobalEventState = 'site_shutdown' | 'weather_haul' | 'weather_bulking' | 'combined_weather';
 export type ContainerEventState = 'open' | 'restricted' | 'blocked';
 export type TransferEventState = 'max' | 'variable' | 'stopped';
 export type RouteEventState = 'open' | 'restricted' | 'blocked';
-export type CalendarEventState = ContainerEventState | TransferEventState | RouteEventState;
+export type CalendarEventState = GlobalEventState | ContainerEventState | TransferEventState | RouteEventState;
 
 export interface CalendarEvent {
   id: string;
   calendarId: string;
   targetType: CalendarTargetType;
-  targetId: string;
+  targetId: string;     // 'site' for global events, or element id
   startDay: number;     // 1..totalDays inclusive
   endDay: number;       // 1..totalDays inclusive (>= startDay)
   state: CalendarEventState;
   rateValue?: number;   // m³/d for transfer 'variable', container 'restricted', or route 'restricted' cap
+  haulRatePct?: number; // Global weather_haul / combined_weather: 0..200% vehicle movement multiplier (default 60)
+  bulkInMultiplier?: number;  // Global weather_bulking / combined_weather: multiplier applied to material bulkIN (default 1.15)
+  bulkOutMultiplier?: number; // Global weather_bulking / combined_weather: multiplier applied to material bulkOUT (default 1.0)
+  affectedMaterials?: string[]; // Optional material codes affected by global weather bulking/haul (empty = all)
   label?: string;
   notes?: string;
 }
@@ -138,14 +143,229 @@ export interface CalendarModel {
   events: CalendarEvent[];
 }
 
+export interface ProjectHoliday {
+  id: string;
+  name: string;
+  startDate: string; // YYYY-MM-DD inclusive
+  endDate: string;   // YYYY-MM-DD inclusive
+}
+
+export interface ProjectSettings {
+  projectName: string;
+  projectNotes?: string;
+  startDate: string; // YYYY-MM-DD (Day 1)
+  endDate: string;   // YYYY-MM-DD (Day N)
+  /** [Sun, Mon, Tue, Wed, Thu, Fri, Sat] — true = working day */
+  workingDays: [boolean, boolean, boolean, boolean, boolean, boolean, boolean];
+  holidays: ProjectHoliday[];
+}
+
+export type AllocationPolicy = 'priority_prorata' | 'priority_equal' | 'strict_order';
+export type PartialDeliveryPolicy = 'allow_partial' | 'discrete_loads' | 'min_batch';
+export type BulkingMode = 'strict_bulking' | 'bank_volume_only';
+export type DiversionOrder = 'backup_corridor_first' | 'standby_link_first';
+
+export interface SimSettings {
+  allocationPolicy: AllocationPolicy;
+  partialDeliveryPolicy: PartialDeliveryPolicy;
+  truckPayloadM3: number;
+  minBatchPct: number;
+  sameDayDrainageCredit: boolean;
+  bulkingMode: BulkingMode;
+  diversionOrder: DiversionOrder;
+  allowOvertimeOnNonWorkingDays: boolean;
+  defaultHeadroomThresholdM3: number;
+  defaultOverflowTriggerPct: number;
+}
+
+export interface SettingsPresetPayload {
+  schemaVersion: 1;
+  exportedAt: string;
+  presetName?: string;
+  projectSettings?: ProjectSettings;
+  simSettings?: SimSettings;
+  globalEvents?: CalendarEvent[];
+}
+
+export const createDefaultProjectSettings = (): ProjectSettings => ({
+  projectName: 'Earthworks Programme',
+  projectNotes: '',
+  startDate: '2026-04-01',
+  endDate: '2026-04-30',
+  workingDays: [true, true, true, true, true, true, true],
+  holidays: []
+});
+
+export const createDefaultSimSettings = (): SimSettings => ({
+  allocationPolicy: 'priority_prorata',
+  partialDeliveryPolicy: 'allow_partial',
+  truckPayloadM3: 18,
+  minBatchPct: 20,
+  sameDayDrainageCredit: true,
+  bulkingMode: 'strict_bulking',
+  diversionOrder: 'backup_corridor_first',
+  allowOvertimeOnNonWorkingDays: false,
+  defaultHeadroomThresholdM3: 500,
+  defaultOverflowTriggerPct: 100
+});
+
+export const normalizeProjectSettings = (raw?: Partial<ProjectSettings> | null): ProjectSettings => {
+  const def = createDefaultProjectSettings();
+  if (!raw || typeof raw !== 'object') return def;
+  const isoRegex = /^\d{4}-\d{2}-\d{2}$/;
+  const startDate = typeof raw.startDate === 'string' && isoRegex.test(raw.startDate.trim()) ? raw.startDate.trim() : def.startDate;
+  const rawEnd = typeof raw.endDate === 'string' && isoRegex.test(raw.endDate.trim()) ? raw.endDate.trim() : def.endDate;
+  const endDate = rawEnd >= startDate ? rawEnd : startDate;
+  const workingDays: [boolean, boolean, boolean, boolean, boolean, boolean, boolean] =
+    Array.isArray(raw.workingDays) && raw.workingDays.length === 7
+      ? [
+          Boolean(raw.workingDays[0]),
+          Boolean(raw.workingDays[1]),
+          Boolean(raw.workingDays[2]),
+          Boolean(raw.workingDays[3]),
+          Boolean(raw.workingDays[4]),
+          Boolean(raw.workingDays[5]),
+          Boolean(raw.workingDays[6])
+        ]
+      : [...def.workingDays];
+  const holidays: ProjectHoliday[] = Array.isArray(raw.holidays)
+    ? raw.holidays
+        .filter(
+          (h): h is ProjectHoliday =>
+            Boolean(h) &&
+            typeof h.name === 'string' &&
+            typeof h.startDate === 'string' &&
+            isoRegex.test(h.startDate.trim()) &&
+            typeof h.endDate === 'string' &&
+            isoRegex.test(h.endDate.trim())
+        )
+        .map((h, idx) => {
+          const s = h.startDate.trim();
+          const e = h.endDate.trim() >= s ? h.endDate.trim() : s;
+          return {
+            id: typeof h.id === 'string' && h.id.trim() ? h.id.trim() : `hol-${idx + 1}`,
+            name: h.name.trim() || 'Site Holiday',
+            startDate: s,
+            endDate: e
+          };
+        })
+    : [];
+
+  return {
+    projectName: typeof raw.projectName === 'string' && raw.projectName.trim() ? raw.projectName.trim() : def.projectName,
+    projectNotes: typeof raw.projectNotes === 'string' ? raw.projectNotes : '',
+    startDate,
+    endDate,
+    workingDays,
+    holidays
+  };
+};
+
+export const normalizeSimSettings = (raw?: Partial<SimSettings> | null): SimSettings => {
+  const def = createDefaultSimSettings();
+  if (!raw || typeof raw !== 'object') return def;
+  const allocationPolicy: AllocationPolicy =
+    raw.allocationPolicy === 'priority_equal' || raw.allocationPolicy === 'strict_order'
+      ? raw.allocationPolicy
+      : 'priority_prorata';
+  const partialDeliveryPolicy: PartialDeliveryPolicy =
+    raw.partialDeliveryPolicy === 'discrete_loads' || raw.partialDeliveryPolicy === 'min_batch'
+      ? raw.partialDeliveryPolicy
+      : 'allow_partial';
+  const bulkingMode: BulkingMode =
+    raw.bulkingMode === 'bank_volume_only' ? 'bank_volume_only' : 'strict_bulking';
+  const diversionOrder: DiversionOrder =
+    raw.diversionOrder === 'standby_link_first' ? 'standby_link_first' : 'backup_corridor_first';
+
+  return {
+    allocationPolicy,
+    partialDeliveryPolicy,
+    truckPayloadM3:
+      typeof raw.truckPayloadM3 === 'number' && Number.isFinite(raw.truckPayloadM3) && raw.truckPayloadM3 >= 1
+        ? Math.min(500, Math.round(raw.truckPayloadM3 * 10) / 10)
+        : def.truckPayloadM3,
+    minBatchPct:
+      typeof raw.minBatchPct === 'number' && Number.isFinite(raw.minBatchPct)
+        ? Math.max(1, Math.min(100, Math.round(raw.minBatchPct)))
+        : def.minBatchPct,
+    sameDayDrainageCredit:
+      typeof raw.sameDayDrainageCredit === 'boolean' ? raw.sameDayDrainageCredit : def.sameDayDrainageCredit,
+    bulkingMode,
+    diversionOrder,
+    allowOvertimeOnNonWorkingDays:
+      typeof raw.allowOvertimeOnNonWorkingDays === 'boolean'
+        ? raw.allowOvertimeOnNonWorkingDays
+        : def.allowOvertimeOnNonWorkingDays,
+    defaultHeadroomThresholdM3:
+      typeof raw.defaultHeadroomThresholdM3 === 'number' && Number.isFinite(raw.defaultHeadroomThresholdM3)
+        ? Math.max(0, Math.round(raw.defaultHeadroomThresholdM3))
+        : def.defaultHeadroomThresholdM3,
+    defaultOverflowTriggerPct:
+      typeof raw.defaultOverflowTriggerPct === 'number' && Number.isFinite(raw.defaultOverflowTriggerPct)
+        ? Math.max(1, Math.min(100, Math.round(raw.defaultOverflowTriggerPct)))
+        : def.defaultOverflowTriggerPct
+  };
+};
+
 export interface LinkRouteSplit {
   primaryFlow: number;
   backupFlow: number;
   activeBackupCorridorIds: string[];
 }
 
+export interface LinkDayMathAudit {
+  linkId: string;
+  role: LinkRole;
+  materialCode: string;
+  statedRate: number;
+  afterCalendar: number;
+  afterGlobalWeather: number;
+  afterSourceStock: number;
+  afterContainerCap: number;
+  afterCorridorAndDetour: number;
+  afterTargetHeadroom: number;
+  afterPartialRule: number;
+  finalDelivered: number;
+  bulkOutApplied: number;
+  bulkInApplied: number;
+  sourceDeductedM3: number;
+  targetDepositedM3: number;
+  bindingConstraint: string;
+  partialRuleNote?: string;
+}
+
+export interface ContainerDayMathAudit {
+  nodeId: string;
+  startVol: number;
+  outboundRemovedM3: number;
+  sameDayCreditApplied: boolean;
+  effectiveHeadroomM3: number;
+  inboundDepositedM3: number;
+  overflowTransferredOutM3: number;
+  endVol: number;
+  headroomHoldLatched: boolean;
+}
+
+export interface DayMathAudit {
+  dateISO: string;
+  weekdayShort: string;
+  isWorkingDay: boolean;
+  nonWorkingReason?: string;
+  siteShutdownActive: boolean;
+  activeGlobalLabels: string[];
+  effectiveHaulPct: number;
+  activeBulkingSummary: string[];
+  totalDeliveredM3: number;
+  links: Record<string, LinkDayMathAudit>;
+  containers: Record<string, ContainerDayMathAudit>;
+}
+
 export interface SimFrame {
   day: number;
+  dateISO?: string;
+  isWorkingDay?: boolean;
+  nonWorkingReason?: string;
+  globalHaulMultiplier?: number;
   nodeVolumes: Record<string, number>;
   linkFlows: Record<string, number>;
   corridorFlows?: Record<string, number>;
@@ -157,6 +377,7 @@ export interface SimFrame {
   nodeStatuses: Record<string, FlowStatus>;
   corridorStatuses?: Record<string, FlowStatus>;
   alerts: string[];
+  dayAudit?: DayMathAudit;
 }
 
 export interface ContainerProperties {

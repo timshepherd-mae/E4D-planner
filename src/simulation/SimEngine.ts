@@ -4,6 +4,8 @@ import {
   RouteCorridor,
   CalendarModel,
   CalendarEvent,
+  ProjectSettings,
+  SimSettings,
   SimFrame,
   MaterialDefinition,
   FlowStatus,
@@ -11,10 +13,21 @@ import {
   StrictSubRule,
   DiversionTrigger,
   LinkRouteSplit,
+  LinkDayMathAudit,
+  ContainerDayMathAudit,
+  DayMathAudit,
+  createDefaultProjectSettings,
+  normalizeProjectSettings,
+  normalizeSimSettings,
   getLinkRole,
   getLinkCorridorIds,
   getLinkBackupCorridorIds
 } from '../models/types';
+import {
+  computeInclusiveDays,
+  addDaysISO,
+  evaluateCalendarDay
+} from '../utils/dateUtils';
 
 export type { OverflowMode, StrictSubRule };
 
@@ -37,6 +50,8 @@ export class SimEngine {
   private corridors: Map<string, RouteCorridor>;
   private materials: Map<string, MaterialDefinition>;
   private calendar?: CalendarModel;
+  private projectSettings: ProjectSettings;
+  private simSettings: SimSettings;
   private totalDays: number;
   private defaultOverflowMode: OverflowMode;
   private headroomHoldStates: Map<string, boolean> = new Map();
@@ -48,7 +63,9 @@ export class SimEngine {
     totalDays: number = 30,
     overflowMode: OverflowMode = 'strict',
     corridors: RouteCorridor[] = [],
-    calendar?: CalendarModel
+    calendar?: CalendarModel,
+    projectSettings?: ProjectSettings,
+    simSettings?: SimSettings
   ) {
     this.nodes = new Map(
       nodes.map(n => [
@@ -65,27 +82,52 @@ export class SimEngine {
     this.calendar = calendar
       ? { ...calendar, events: (calendar.events || []).map(e => ({ ...e })) }
       : undefined;
-    this.totalDays = totalDays;
+
+    if (projectSettings) {
+      this.projectSettings = normalizeProjectSettings(projectSettings);
+      this.totalDays = computeInclusiveDays(this.projectSettings.startDate, this.projectSettings.endDate);
+    } else {
+      const defProj = createDefaultProjectSettings();
+      const clampedDays = Math.max(1, Math.round(totalDays || 30));
+      defProj.endDate = addDaysISO(defProj.startDate, clampedDays - 1);
+      this.projectSettings = defProj;
+      this.totalDays = clampedDays;
+    }
+
+    this.simSettings = normalizeSimSettings(simSettings);
     this.defaultOverflowMode = overflowMode;
   }
 
-  private getLinkMaterial(link: TransferLink, source: ContainerNode): LinkMaterialInfo {
+  private getLinkMaterial(
+    link: TransferLink,
+    source: ContainerNode,
+    bulkingModifiers?: Map<string, { inMult: number; outMult: number }>,
+    globalAllBulk?: { inMult: number; outMult: number }
+  ): LinkMaterialInfo {
     const code =
       link.materialId && link.materialId.trim()
         ? link.materialId.trim().toUpperCase()
         : source.materialType;
+    if (this.simSettings.bulkingMode === 'bank_volume_only') {
+      return { code, bulkIN: 1.0, bulkOUT: 1.0 };
+    }
     const mat = this.materials.get(code);
+    const baseIn = mat ? mat.bulkIN : 1.0;
+    const baseOut = mat ? mat.bulkOUT : 1.0;
+    const matMod = bulkingModifiers?.get(code);
+    const inMult = (globalAllBulk?.inMult ?? 1.0) * (matMod?.inMult ?? 1.0);
+    const outMult = (globalAllBulk?.outMult ?? 1.0) * (matMod?.outMult ?? 1.0);
     return {
       code,
-      bulkIN: mat ? mat.bulkIN : 1.0,
-      bulkOUT: mat ? mat.bulkOUT : 1.0
+      bulkIN: Math.max(0.05, baseIn * inMult),
+      bulkOUT: Math.max(0.05, baseOut * outMult)
     };
   }
 
   /**
    * Allocates a scalar budget across competing links ordered by ascending priority
-   * (lower numeric priority = higher precedence; default 1). Links sharing the same
-   * priority tier split remaining budget pro-rata by their weighted demand.
+   * (lower numeric priority = higher precedence; default 1).
+   * Respects simSettings.allocationPolicy ('priority_prorata' | 'priority_equal' | 'strict_order').
    */
   private allocateByPriority(
     links: TransferLink[],
@@ -107,6 +149,7 @@ export class SimEngine {
 
     const sortedPriorities = Array.from(tiers.keys()).sort((a, b) => a - b);
     let remaining = Math.max(0, budget);
+    const policy = this.simSettings.allocationPolicy;
 
     for (const p of sortedPriorities) {
       const tierLinks = tiers.get(p) || [];
@@ -133,19 +176,89 @@ export class SimEngine {
         }
         remaining = Math.max(0, remaining - tierCost);
       } else if (remaining > eps) {
-        const ratio = remaining / tierCost;
-        for (const link of tierLinks) {
-          const demand = Math.max(0, demands.get(link.id) ?? 0);
-          const factor = Math.max(0, costFactorFn(link));
-          if (demand > eps && factor > eps) {
-            const granted = demand * ratio;
+        if (policy === 'strict_order') {
+          let tierRem = remaining;
+          for (const link of tierLinks) {
+            const demand = Math.max(0, demands.get(link.id) ?? 0);
+            const factor = Math.max(0, costFactorFn(link));
+            if (demand <= eps || factor <= eps) {
+              allocations.set(link.id, demand);
+              continue;
+            }
+            const maxByRem = tierRem / factor;
+            const granted = Math.min(demand, Math.max(0, maxByRem));
             allocations.set(link.id, granted);
+            tierRem = Math.max(0, tierRem - granted * factor);
             if (granted < demand - eps) wasThrottled = true;
-          } else {
-            allocations.set(link.id, demand);
           }
+          remaining = 0;
+        } else if (policy === 'priority_equal') {
+          // Water-filling equal cost share across active links in tier
+          const active = tierLinks
+            .map(link => ({
+              link,
+              demand: Math.max(0, demands.get(link.id) ?? 0),
+              factor: Math.max(0, costFactorFn(link))
+            }))
+            .filter(item => {
+              if (item.demand <= eps || item.factor <= eps) {
+                allocations.set(item.link.id, item.demand);
+                return false;
+              }
+              return true;
+            });
+
+          let tierRem = remaining;
+          let unsettled = [...active];
+          while (unsettled.length > 0 && tierRem > eps) {
+            const equalCostShare = tierRem / unsettled.length;
+            let saturatedAny = false;
+            const nextUnsettled: typeof unsettled = [];
+            for (const item of unsettled) {
+              const fullCost = item.demand * item.factor;
+              if (fullCost <= equalCostShare + eps) {
+                allocations.set(item.link.id, item.demand);
+                tierRem = Math.max(0, tierRem - fullCost);
+                saturatedAny = true;
+              } else {
+                nextUnsettled.push(item);
+              }
+            }
+            if (!saturatedAny) {
+              const finalShare = tierRem / nextUnsettled.length;
+              for (const item of nextUnsettled) {
+                const granted = Math.min(item.demand, finalShare / item.factor);
+                allocations.set(item.link.id, granted);
+                if (granted < item.demand - eps) wasThrottled = true;
+              }
+              tierRem = 0;
+              break;
+            }
+            unsettled = nextUnsettled;
+          }
+          for (const item of unsettled) {
+            if (!allocations.has(item.link.id)) {
+              allocations.set(item.link.id, 0);
+              wasThrottled = true;
+            }
+          }
+          remaining = 0;
+        } else {
+          // Default: priority_prorata
+          const ratio = remaining / tierCost;
+          for (const link of tierLinks) {
+            const demand = Math.max(0, demands.get(link.id) ?? 0);
+            const factor = Math.max(0, costFactorFn(link));
+            if (demand > eps && factor > eps) {
+              const granted = demand * ratio;
+              allocations.set(link.id, granted);
+              if (granted < demand - eps) wasThrottled = true;
+            } else {
+              allocations.set(link.id, demand);
+            }
+          }
+          remaining = 0;
         }
-        remaining = 0;
       } else {
         for (const link of tierLinks) {
           const demand = Math.max(0, demands.get(link.id) ?? 0);
@@ -161,6 +274,53 @@ export class SimEngine {
     }
 
     return { allocations, wasThrottled };
+  }
+
+  private applyPartialRuleToFlow(
+    feasibleFlow: number,
+    expectedRate: number,
+    eps: number
+  ): { flow: number; note?: string; modified: boolean } {
+    if (feasibleFlow <= eps) {
+      return { flow: 0, modified: false };
+    }
+    const isPartial = expectedRate > eps && feasibleFlow < expectedRate - eps;
+    if (!isPartial) {
+      return { flow: feasibleFlow, modified: false };
+    }
+
+    const policy = this.simSettings.partialDeliveryPolicy;
+    if (policy === 'discrete_loads') {
+      const payload = Math.max(1, this.simSettings.truckPayloadM3 || 18);
+      const loads = Math.floor((feasibleFlow + eps) / payload);
+      const snapped = loads * payload;
+      if (Math.abs(snapped - feasibleFlow) > eps) {
+        return {
+          flow: snapped,
+          note:
+            loads > 0
+              ? `Discrete loads: ${loads} × ${payload} m³ (${Math.round(feasibleFlow)} → ${Math.round(snapped)} m³)`
+              : `Below 1 full load (${Math.round(feasibleFlow)} < ${payload} m³ payload)`,
+          modified: true
+        };
+      }
+      return { flow: feasibleFlow, modified: false };
+    }
+
+    if (policy === 'min_batch') {
+      const minPct = Math.max(1, Math.min(100, this.simSettings.minBatchPct || 20));
+      const minVol = expectedRate * (minPct / 100);
+      if (feasibleFlow < minVol - eps) {
+        return {
+          flow: 0,
+          note: `Held below ${minPct}% min batch (${Math.round(feasibleFlow)} < ${Math.round(minVol)} m³)`,
+          modified: true
+        };
+      }
+      return { flow: feasibleFlow, modified: false };
+    }
+
+    return { flow: feasibleFlow, modified: false };
   }
 
   public runSimulation(): SimFrame[] {
@@ -215,12 +375,28 @@ export class SimEngine {
         startOfDayVolumes[n.id] = n.type === 'null' ? 0 : n.currentVolume;
       });
 
+      const dayCal = evaluateCalendarDay(this.projectSettings, day);
+
       // Day 0: Frozen baseline
       if (day === 0) {
+        const day0ContainersAudit: Record<string, ContainerDayMathAudit> = {};
+        const day0LinksAudit: Record<string, LinkDayMathAudit> = {};
         this.nodes.forEach(node => {
           const vol = node.type === 'null' ? 0 : node.currentVolume;
           nodeVolumes[node.id] = vol;
           nodeStatuses[node.id] = 'frozen';
+          day0ContainersAudit[node.id] = {
+            nodeId: node.id,
+            startVol: vol,
+            outboundRemovedM3: 0,
+            sameDayCreditApplied: this.simSettings.sameDayDrainageCredit,
+            effectiveHeadroomM3:
+              node.type === 'external' || node.type === 'null' ? 0 : Math.max(0, node.capacity - vol),
+            inboundDepositedM3: 0,
+            overflowTransferredOutM3: 0,
+            endVol: vol,
+            headroomHoldLatched: false
+          };
           if (node.type !== 'external' && node.type !== 'null' && vol > node.capacity + EPS) {
             const excess = vol - node.capacity;
             const targetOverflowMode = node.overflowMode || this.defaultOverflowMode;
@@ -234,8 +410,29 @@ export class SimEngine {
           }
         });
         this.links.forEach(l => {
+          const src = this.nodes.get(l.sourceId);
+          const mat = src ? this.getLinkMaterial(l, src) : { code: '', bulkIN: 1, bulkOUT: 1 };
           linkFlows[l.id] = 0;
           linkStatuses[l.id] = 'frozen';
+          day0LinksAudit[l.id] = {
+            linkId: l.id,
+            role: getLinkRole(l),
+            materialCode: mat.code,
+            statedRate: l.dailyRate,
+            afterCalendar: 0,
+            afterGlobalWeather: 0,
+            afterSourceStock: 0,
+            afterContainerCap: 0,
+            afterCorridorAndDetour: 0,
+            afterTargetHeadroom: 0,
+            afterPartialRule: 0,
+            finalDelivered: 0,
+            bulkOutApplied: mat.bulkOUT,
+            bulkInApplied: mat.bulkIN,
+            sourceDeductedM3: 0,
+            targetDepositedM3: 0,
+            bindingConstraint: 'Day 0 Baseline (Frozen)'
+          };
         });
         this.corridors.forEach(c => {
           corridorFlows[c.id] = 0;
@@ -245,6 +442,9 @@ export class SimEngine {
 
         frames.push({
           day,
+          dateISO: dayCal.dateISO,
+          isWorkingDay: true,
+          globalHaulMultiplier: 1,
           nodeVolumes,
           linkFlows,
           corridorFlows,
@@ -255,22 +455,37 @@ export class SimEngine {
           linkStatuses,
           nodeStatuses,
           corridorStatuses,
-          alerts
+          alerts,
+          dayAudit: {
+            dateISO: dayCal.dateISO,
+            weekdayShort: dayCal.weekdayShort,
+            isWorkingDay: true,
+            siteShutdownActive: false,
+            activeGlobalLabels: [],
+            effectiveHaulPct: 100,
+            activeBulkingSummary: [],
+            totalDeliveredM3: 0,
+            links: day0LinksAudit,
+            containers: day0ContainersAudit
+          }
         });
         continue;
       }
 
       // =========================================================================
-      // Stage 0: Active Calendar Events & Effective Link Rates
+      // Stage 0: Active Calendar Events, Workweek/Holidays, Global Events & Link Rates
       // =========================================================================
       const activeContainerEvents = new Map<string, CalendarEvent>();
       const activeTransferEvents = new Map<string, CalendarEvent>();
       const activeRouteEvents = new Map<string, CalendarEvent>();
+      const activeGlobalEvents: CalendarEvent[] = [];
 
       if (allEvents.length > 0) {
         for (const evt of allEvents) {
           if (day >= evt.startDay && day <= evt.endDay) {
-            if (evt.targetType === 'container') {
+            if (evt.targetType === 'global') {
+              activeGlobalEvents.push(evt);
+            } else if (evt.targetType === 'container') {
               activeContainerEvents.set(evt.targetId, evt);
             } else if (evt.targetType === 'transfer') {
               activeTransferEvents.set(evt.targetId, evt);
@@ -280,6 +495,91 @@ export class SimEngine {
           }
         }
       }
+
+      // Evaluate Global Events (Site Shutdown, Weather Haul, Weather Bulking)
+      let globalShutdownActive = false;
+      let globalAllHaulMult = 1.0;
+      const materialHaulMods = new Map<string, number>();
+      const globalAllBulk = { inMult: 1.0, outMult: 1.0 };
+      const materialBulkMods = new Map<string, { inMult: number; outMult: number }>();
+      const activeGlobalLabels: string[] = [];
+      const activeBulkingSummary: string[] = [];
+
+      for (const gEvt of activeGlobalEvents) {
+        const label = gEvt.label?.trim() || (
+          gEvt.state === 'site_shutdown'
+            ? 'Site Shutdown'
+            : gEvt.state === 'weather_haul'
+            ? 'Weather Haul Impact'
+            : gEvt.state === 'weather_bulking'
+            ? 'Weather Bulking Modifier'
+            : 'Combined Weather Event'
+        );
+        activeGlobalLabels.push(label);
+
+        if (gEvt.state === 'site_shutdown') {
+          globalShutdownActive = true;
+          pushAlert(`Day ${day} (${dayCal.dateISO}): Global site shutdown active (${label}). All site transfers halted.`);
+          continue;
+        }
+
+        const scopedMats =
+          Array.isArray(gEvt.affectedMaterials) && gEvt.affectedMaterials.length > 0
+            ? gEvt.affectedMaterials.map(m => m.trim().toUpperCase()).filter(Boolean)
+            : [];
+
+        if (gEvt.state === 'weather_haul' || gEvt.state === 'combined_weather') {
+          const pct = Math.max(0, Math.min(200, Number.isFinite(gEvt.haulRatePct) ? (gEvt.haulRatePct as number) : 60));
+          const mult = pct / 100;
+          if (scopedMats.length === 0) {
+            globalAllHaulMult *= mult;
+          } else {
+            scopedMats.forEach(code => {
+              materialHaulMods.set(code, (materialHaulMods.get(code) ?? 1.0) * mult);
+            });
+          }
+          pushAlert(
+            `Day ${day} (${dayCal.dateISO}): Global weather event (${label}) scaling ${scopedMats.length > 0 ? scopedMats.join('/') : 'all'} haul rates to ${Math.round(pct)}%.`
+          );
+        }
+
+        if (gEvt.state === 'weather_bulking' || gEvt.state === 'combined_weather') {
+          const inM = Math.max(0.25, Math.min(3.0, Number.isFinite(gEvt.bulkInMultiplier) ? (gEvt.bulkInMultiplier as number) : 1.15));
+          const outM = Math.max(0.25, Math.min(3.0, Number.isFinite(gEvt.bulkOutMultiplier) ? (gEvt.bulkOutMultiplier as number) : 1.0));
+          if (scopedMats.length === 0) {
+            globalAllBulk.inMult *= inM;
+            globalAllBulk.outMult *= outM;
+            activeBulkingSummary.push(`All: IN ×${inM.toFixed(2)}, OUT ×${outM.toFixed(2)}`);
+          } else {
+            scopedMats.forEach(code => {
+              const cur = materialBulkMods.get(code) || { inMult: 1.0, outMult: 1.0 };
+              materialBulkMods.set(code, { inMult: cur.inMult * inM, outMult: cur.outMult * outM });
+            });
+            activeBulkingSummary.push(`${scopedMats.join('/')}: IN ×${inM.toFixed(2)}, OUT ×${outM.toFixed(2)}`);
+          }
+          pushAlert(
+            `Day ${day} (${dayCal.dateISO}): Weather bulking modifier (${label}) active (${scopedMats.length > 0 ? scopedMats.join('/') : 'All'}: IN ×${inM.toFixed(2)}, OUT ×${outM.toFixed(2)}).`
+          );
+        }
+      }
+
+      if (!dayCal.isWorkingDay && !globalShutdownActive) {
+        if (dayCal.holiday) {
+          pushAlert(
+            `Day ${day} (${dayCal.dateISO}): Holiday shutdown (${dayCal.holiday.name}).${this.simSettings.allowOvertimeOnNonWorkingDays ? ' Explicit overtime events permitted.' : ' Site halted.'}`
+          );
+        }
+      }
+
+      const resolveLinkMaterial = (link: TransferLink, source: ContainerNode): LinkMaterialInfo =>
+        this.getLinkMaterial(link, source, materialBulkMods, globalAllBulk);
+
+      const getLinkHaulMultiplier = (link: TransferLink): number => {
+        const src = this.nodes.get(link.sourceId);
+        const code = src ? resolveLinkMaterial(link, src).code : (link.materialId || '').toUpperCase();
+        const matMult = code ? (materialHaulMods.get(code) ?? 1.0) : 1.0;
+        return Math.max(0, globalAllHaulMult * matMult);
+      };
 
       const getNodeScheduleState = (
         node: ContainerNode
@@ -358,6 +658,9 @@ export class SimEngine {
 
       const activeLinkRates = new Map<string, number>();
       const baselineLinkRates = new Map<string, number>();
+      const afterCalendarRates = new Map<string, number>();
+      const globalHaulReducedLinks = new Set<string>();
+      const nonWorkingHaltedLinks = new Set<string>();
       const calendarStoppedLinks = new Set<string>();
 
       this.links.forEach(link => {
@@ -410,6 +713,33 @@ export class SimEngine {
           }
         }
 
+        afterCalendarRates.set(link.id, Math.max(0, currentRate));
+
+        // Apply Global Site Shutdown, Non-Working Days, and Global Weather Haul Multiplier
+        if (globalShutdownActive) {
+          currentRate = 0;
+          calendarStoppedLinks.add(link.id);
+        } else if (!dayCal.isWorkingDay) {
+          const hasExplicitOvertime =
+            this.simSettings.allowOvertimeOnNonWorkingDays &&
+            Boolean(calEvt && (calEvt.state === 'max' || (calEvt.state === 'variable' && currentRate > EPS)));
+          if (!hasExplicitOvertime) {
+            currentRate = 0;
+            nonWorkingHaltedLinks.add(link.id);
+          }
+        }
+
+        if (currentRate > EPS) {
+          const haulMult = getLinkHaulMultiplier(link);
+          if (Math.abs(haulMult - 1.0) > EPS) {
+            const beforeWeather = currentRate;
+            currentRate = Math.max(0, currentRate * haulMult);
+            if (currentRate < beforeWeather - EPS) {
+              globalHaulReducedLinks.add(link.id);
+            }
+          }
+        }
+
         activeLinkRates.set(link.id, Math.max(0, currentRate));
       });
 
@@ -453,7 +783,7 @@ export class SimEngine {
             return;
           }
 
-          const matInfo = this.getLinkMaterial(link, source);
+          const matInfo = resolveLinkMaterial(link, source);
           if (target.allowedMaterials && target.allowedMaterials.length > 0) {
             if (!target.allowedMaterials.includes(matInfo.code)) {
               requestedTransfers.set(link.id, 0);
@@ -496,7 +826,7 @@ export class SimEngine {
 
         const requiredSourceVol = validLinks.reduce((sum, link) => {
           const rate = demands.get(link.id) ?? 0;
-          const { bulkOUT } = this.getLinkMaterial(link, source);
+          const { bulkOUT } = resolveLinkMaterial(link, source);
           return sum + rate * bulkOUT;
         }, 0);
 
@@ -504,7 +834,7 @@ export class SimEngine {
           validLinks,
           demands,
           availableVol,
-          link => this.getLinkMaterial(link, source).bulkOUT,
+          link => resolveLinkMaterial(link, source).bulkOUT,
           EPS
         );
 
@@ -523,6 +853,9 @@ export class SimEngine {
           );
         }
       });
+
+      const afterSourceStockFlows = new Map<string, number>();
+      requestedTransfers.forEach((v, id) => afterSourceStockFlows.set(id, v));
 
       // =========================================================================
       // Stage 1.25: Container Calendar 'restricted' Throughput Cap (Primary Links)
@@ -712,10 +1045,27 @@ export class SimEngine {
       });
 
       // Pass 1.5B: Backup Route Corridor Spillover (Unmet Remainder)
+      // When diversionOrder === 'standby_link_first', defer backup detour for primary links
+      // that have an active watching standby link with 'route' trigger enabled so standby runs first.
+      const deferredBackupDetourLinkIds = new Set<string>();
+      if (this.simSettings.diversionOrder === 'standby_link_first' && standbyLinksList.length > 0) {
+        standbyLinksList.forEach(sLink => {
+          if (!sLink.primaryLinkId) return;
+          const triggers: DiversionTrigger[] =
+            sLink.diversionTriggers && sLink.diversionTriggers.length > 0
+              ? sLink.diversionTriggers
+              : ['route', 'target', 'calendar'];
+          if (triggers.includes('route') && (activeLinkRates.get(sLink.id) ?? 0) > EPS) {
+            deferredBackupDetourLinkIds.add(sLink.primaryLinkId);
+          }
+        });
+      }
+
       const detourDemands = new Map<string, number>();
       const detourCandidates: TransferLink[] = [];
 
       primaryLinksList.forEach(link => {
+        if (deferredBackupDetourLinkIds.has(link.id)) return;
         const preReq = preRouteFlows.get(link.id) ?? 0;
         const primAlloc = primaryRouteAllocated.get(link.id) ?? 0;
         const unmet = Math.max(0, preReq - primAlloc);
@@ -943,7 +1293,7 @@ export class SimEngine {
           overflowLinkMaxCap.set(link.id, 0);
           return;
         }
-        const matInfo = this.getLinkMaterial(link, src);
+        const matInfo = resolveLinkMaterial(link, src);
         if (tgt.allowedMaterials && tgt.allowedMaterials.length > 0 && !tgt.allowedMaterials.includes(matInfo.code)) {
           materialMismatchLinks.add(link.id);
           overflowLinkMaxCap.set(link.id, 0);
@@ -984,20 +1334,22 @@ export class SimEngine {
             const flow = workingFlows.get(inLink.id) ?? 0;
             if (flow <= EPS) return sum;
             const src = this.nodes.get(inLink.sourceId);
-            const bulkIn = src ? this.getLinkMaterial(inLink, src).bulkIN : 1.0;
+            const bulkIn = src ? resolveLinkMaterial(inLink, src).bulkIN : 1.0;
             return sum + flow * bulkIn;
           }, 0);
 
           if (inboundDeposit <= EPS) return;
 
-          const normalOutboundRemoved = outbound
-            .filter(l => getLinkRole(l) !== 'overflow')
-            .reduce((sum, outLink) => {
-              const flow = workingFlows.get(outLink.id) ?? 0;
-              if (flow <= EPS) return sum;
-              const { bulkOUT } = this.getLinkMaterial(outLink, node);
-              return sum + flow * bulkOUT;
-            }, 0);
+          const normalOutboundRemoved = this.simSettings.sameDayDrainageCredit
+            ? outbound
+                .filter(l => getLinkRole(l) !== 'overflow')
+                .reduce((sum, outLink) => {
+                  const flow = workingFlows.get(outLink.id) ?? 0;
+                  if (flow <= EPS) return sum;
+                  const { bulkOUT } = resolveLinkMaterial(outLink, node);
+                  return sum + flow * bulkOUT;
+                }, 0)
+            : 0;
 
           const triggerPct = Math.max(1, Math.min(100, node.overflowTriggerPct ?? 100));
           const triggerCap = node.capacity * (triggerPct / 100);
@@ -1017,7 +1369,7 @@ export class SimEngine {
             overflowOut,
             capDemands,
             desiredSpillVol,
-            l => this.getLinkMaterial(l, node).bulkOUT,
+            l => resolveLinkMaterial(l, node).bulkOUT,
             EPS
           );
 
@@ -1087,7 +1439,11 @@ export class SimEngine {
           const outboundRemoved = outboundLinks.reduce((sum, outLink) => {
             const flow = workingFlows.get(outLink.id) ?? 0;
             if (flow <= EPS) return sum;
-            const { bulkOUT } = this.getLinkMaterial(outLink, target);
+            const { bulkOUT } = resolveLinkMaterial(outLink, target);
+            const isOverflowLink = getLinkRole(outLink) === 'overflow';
+            if (!this.simSettings.sameDayDrainageCredit && !isOverflowLink) {
+              return sum;
+            }
             return sum + flow * bulkOUT;
           }, 0);
 
@@ -1125,7 +1481,7 @@ export class SimEngine {
             effectiveHeadroom,
             link => {
               const src = this.nodes.get(link.sourceId);
-              return src ? this.getLinkMaterial(link, src).bulkIN : 1.0;
+              return src ? resolveLinkMaterial(link, src).bulkIN : 1.0;
             },
             EPS
           );
@@ -1148,15 +1504,17 @@ export class SimEngine {
                 const flow = workingFlows.get(inLink.id) ?? 0;
                 if (flow <= EPS) return sum;
                 const src = this.nodes.get(inLink.sourceId);
-                return sum + flow * (src ? this.getLinkMaterial(inLink, src).bulkIN : 1.0);
+                return sum + flow * (src ? resolveLinkMaterial(inLink, src).bulkIN : 1.0);
               }, 0);
-              const normalOutboundRemoved = outboundLinks
-                .filter(l => getLinkRole(l) !== 'overflow')
-                .reduce((sum, outLink) => {
-                  const flow = workingFlows.get(outLink.id) ?? 0;
-                  if (flow <= EPS) return sum;
-                  return sum + flow * this.getLinkMaterial(outLink, target).bulkOUT;
-                }, 0);
+              const normalOutboundRemoved = this.simSettings.sameDayDrainageCredit
+                ? outboundLinks
+                    .filter(l => getLinkRole(l) !== 'overflow')
+                    .reduce((sum, outLink) => {
+                      const flow = workingFlows.get(outLink.id) ?? 0;
+                      if (flow <= EPS) return sum;
+                      return sum + flow * resolveLinkMaterial(outLink, target).bulkOUT;
+                    }, 0)
+                : 0;
 
               const triggerPct = Math.max(1, Math.min(100, target.overflowTriggerPct ?? 100));
               const triggerCap = target.capacity * (triggerPct / 100);
@@ -1168,7 +1526,7 @@ export class SimEngine {
 
               const currentOvfRemoved = overflowOut.reduce((sum, outLink) => {
                 const flow = workingFlows.get(outLink.id) ?? 0;
-                return sum + flow * this.getLinkMaterial(outLink, target).bulkOUT;
+                return sum + flow * resolveLinkMaterial(outLink, target).bulkOUT;
               }, 0);
 
               if (currentOvfRemoved > maxAllowedSpill + EPS) {
@@ -1176,7 +1534,7 @@ export class SimEngine {
                   overflowOut,
                   workingFlows,
                   maxAllowedSpill,
-                  l => this.getLinkMaterial(l, target).bulkOUT,
+                  l => resolveLinkMaterial(l, target).bulkOUT,
                   EPS
                 );
                 overflowOut.forEach(l => {
@@ -1227,6 +1585,67 @@ export class SimEngine {
         if (maxDelta <= EPS) break;
       }
 
+      // Snapshot post-Stage-2A headroom flows before Partial Delivery Policy
+      const afterTargetHeadroomFlows = new Map<string, number>();
+      workingFlows.forEach((v, id) => afterTargetHeadroomFlows.set(id, v));
+
+      // Apply Partial Delivery Policy (Discrete Truck Loads / Minimum Batch Threshold)
+      const partialRuleNotes = new Map<string, string>();
+      if (this.simSettings.partialDeliveryPolicy !== 'allow_partial') {
+        let partialChanged = false;
+        primaryLinksList.forEach(link => {
+          const cur = workingFlows.get(link.id) ?? 0;
+          const expected = activeLinkRates.get(link.id) ?? link.dailyRate;
+          const res = this.applyPartialRuleToFlow(cur, expected, EPS);
+          if (res.modified) {
+            workingFlows.set(link.id, res.flow);
+            partialChanged = true;
+          }
+          if (res.note) {
+            partialRuleNotes.set(link.id, res.note);
+            const srcName = this.nodes.get(link.sourceId)?.name || link.sourceId;
+            const tgtName = this.nodes.get(link.targetId)?.name || link.targetId;
+            pushAlert(`Day ${day}: Transfer ${srcName} → ${tgtName} — ${res.note}.`);
+          }
+        });
+
+        // Re-balance null junctions if partial delivery rounded down a connected link
+        if (partialChanged) {
+          for (let iter = 0; iter < 4; iter++) {
+            let maxDelta = 0;
+            this.nodes.forEach(node => {
+              if (node.type !== 'null') return;
+              const inbound = targetInboundLinks.get(node.id) || [];
+              const outbound = sourceOutboundLinks.get(node.id) || [];
+              const totalIn = inbound.reduce((s, l) => s + (workingFlows.get(l.id) ?? 0), 0);
+              const totalOut = outbound.reduce((s, l) => s + (workingFlows.get(l.id) ?? 0), 0);
+              if (totalOut > totalIn + EPS) {
+                const { allocations } = this.allocateByPriority(outbound, workingFlows, totalIn, () => 1.0, EPS);
+                outbound.forEach(link => {
+                  const prev = workingFlows.get(link.id) ?? 0;
+                  const next = Math.max(0, allocations.get(link.id) ?? 0);
+                  if (Math.abs(prev - next) > EPS) {
+                    workingFlows.set(link.id, next);
+                    maxDelta = Math.max(maxDelta, Math.abs(prev - next));
+                  }
+                });
+              } else if (totalIn > totalOut + EPS) {
+                const { allocations } = this.allocateByPriority(inbound, workingFlows, totalOut, () => 1.0, EPS);
+                inbound.forEach(link => {
+                  const prev = workingFlows.get(link.id) ?? 0;
+                  const next = Math.max(0, allocations.get(link.id) ?? 0);
+                  if (Math.abs(prev - next) > EPS) {
+                    workingFlows.set(link.id, next);
+                    maxDelta = Math.max(maxDelta, Math.abs(prev - next));
+                  }
+                });
+              }
+            });
+            if (maxDelta <= EPS) break;
+          }
+        }
+      }
+
       // Record route usage & route splits for active overflow links
       overflowLinksList.forEach(link => {
         const flow = workingFlows.get(link.id) ?? 0;
@@ -1271,7 +1690,11 @@ export class SimEngine {
         const outboundRemoved = outboundLinks.reduce((sum, outLink) => {
           const flow = workingFlows.get(outLink.id) ?? 0;
           if (flow <= EPS) return sum;
-          const { bulkOUT } = this.getLinkMaterial(outLink, target);
+          const { bulkOUT } = resolveLinkMaterial(outLink, target);
+          const isOverflowLink = getLinkRole(outLink) === 'overflow';
+          if (!this.simSettings.sameDayDrainageCredit && !isOverflowLink) {
+            return sum;
+          }
           return sum + flow * bulkOUT;
         }, 0);
         const effectiveHeadroom = Math.max(0, target.capacity - Math.max(0, startVol - outboundRemoved));
@@ -1284,7 +1707,7 @@ export class SimEngine {
         const totalPreTargetDeposit = primaryInbound.reduce((sum, l) => {
           const pre = preTargetFlows.get(l.id) ?? 0;
           const src = this.nodes.get(l.sourceId);
-          const bulkIn = src ? this.getLinkMaterial(l, src).bulkIN : 1.0;
+          const bulkIn = src ? resolveLinkMaterial(l, src).bulkIN : 1.0;
           return sum + pre * bulkIn;
         }, 0);
 
@@ -1323,7 +1746,7 @@ export class SimEngine {
           const actualInboundDeposit = primaryInbound.reduce((sum, l) => {
             const actual = workingFlows.get(l.id) ?? 0;
             const src = this.nodes.get(l.sourceId);
-            const bulkIn = src ? this.getLinkMaterial(l, src).bulkIN : 1.0;
+            const bulkIn = src ? resolveLinkMaterial(l, src).bulkIN : 1.0;
             return sum + actual * bulkIn;
           }, 0);
           if (totalPreTargetDeposit > actualInboundDeposit + EPS) {
@@ -1350,29 +1773,33 @@ export class SimEngine {
       // =========================================================================
       const standbyTriggeredLinks = new Set<string>();
 
-      if (standbyLinksList.length > 0) {
-        // Track committed physical deltas & container throughputs from Stage 2A
-        const committedRemoved = new Map<string, number>();
-        const committedAdded = new Map<string, number>();
-        const committedThroughput = new Map<string, number>();
+      // Track committed physical deltas & container throughputs from Stage 2A
+      const committedRemoved = new Map<string, number>();
+      const committedAdded = new Map<string, number>();
+      const committedThroughput = new Map<string, number>();
 
+      if (standbyLinksList.length > 0 || deferredBackupDetourLinkIds.size > 0) {
         this.links.forEach(link => {
           const flow = workingFlows.get(link.id) ?? 0;
           if (flow <= EPS) return;
           const src = this.nodes.get(link.sourceId);
           const tgt = this.nodes.get(link.targetId);
           if (src && src.type !== 'null') {
-            const { bulkOUT } = this.getLinkMaterial(link, src);
+            const { bulkOUT } = resolveLinkMaterial(link, src);
             committedRemoved.set(src.id, (committedRemoved.get(src.id) ?? 0) + flow * bulkOUT);
             committedThroughput.set(src.id, (committedThroughput.get(src.id) ?? 0) + flow);
           }
           if (tgt && tgt.type !== 'null') {
-            const { bulkIN } = src ? this.getLinkMaterial(link, src) : { bulkIN: 1.0 };
+            const { bulkIN } = src ? resolveLinkMaterial(link, src) : { bulkIN: 1.0 };
             committedAdded.set(tgt.id, (committedAdded.get(tgt.id) ?? 0) + flow * bulkIN);
             committedThroughput.set(tgt.id, (committedThroughput.get(tgt.id) ?? 0) + flow);
           }
         });
+      }
 
+      const standbyDivertedByPrimary = new Map<string, number>();
+
+      if (standbyLinksList.length > 0) {
         // Group standby links by watched primaryLinkId
         const standbysByPrimary = new Map<string, TransferLink[]>();
         standbyLinksList.forEach(sLink => {
@@ -1443,7 +1870,7 @@ export class SimEngine {
             const sRate = activeLinkRates.get(sLink.id) ?? 0;
             if (sRate <= EPS) continue;
 
-            const matInfo = this.getLinkMaterial(sLink, sSrc);
+            const matInfo = resolveLinkMaterial(sLink, sSrc);
             if (
               sTgt.allowedMaterials &&
               sTgt.allowedMaterials.length > 0 &&
@@ -1493,7 +1920,8 @@ export class SimEngine {
                   targetMaxFlow = 0;
                 } else {
                   const tgtStart = startOfDayVolumes[sTgt.id] ?? 0;
-                  const tgtAfterOut = Math.max(0, tgtStart - (committedRemoved.get(sTgt.id) ?? 0));
+                  const tgtOutCredit = this.simSettings.sameDayDrainageCredit ? (committedRemoved.get(sTgt.id) ?? 0) : 0;
+                  const tgtAfterOut = Math.max(0, tgtStart - tgtOutCredit);
                   const tgtProjected = tgtAfterOut + (committedAdded.get(sTgt.id) ?? 0);
                   const tgtRemHeadroom = Math.max(0, sTgt.capacity - tgtProjected);
                   targetMaxFlow = matInfo.bulkIN > EPS ? tgtRemHeadroom / matInfo.bulkIN : 0;
@@ -1512,11 +1940,19 @@ export class SimEngine {
 
             // 4. Route corridor cap (including standby link's own backup corridors if assigned)
             const routeRes = computeSingleLinkRouteCapacity(sLink, preRouteDesired);
-            const granted = routeRes.totalCap;
+            const partialCheck = this.applyPartialRuleToFlow(routeRes.totalCap, sRate, EPS);
+            const granted = partialCheck.flow;
+            if (partialCheck.note) {
+              partialRuleNotes.set(sLink.id, partialCheck.note);
+            }
             if (granted <= EPS) continue;
 
             workingFlows.set(sLink.id, granted);
             remainingShortfall = Math.max(0, remainingShortfall - granted);
+            standbyDivertedByPrimary.set(
+              pLink.id,
+              (standbyDivertedByPrimary.get(pLink.id) ?? 0) + granted
+            );
 
             // Deduct committed budgets
             if (sSrc.type !== 'null') {
@@ -1538,18 +1974,21 @@ export class SimEngine {
               });
             }
             if (routeRes.backupCap > EPS && routeRes.activeBackupIds.length > 0) {
-              rawRouteSplits.set(sLink.id, {
-                primaryFlow: routeRes.primaryCap,
-                backupFlow: routeRes.backupCap,
-                activeBackupCorridorIds: routeRes.activeBackupIds
-              });
-              routeRes.activeBackupIds.forEach(cid => {
-                corridorUsedRate.set(cid, (corridorUsedRate.get(cid) ?? 0) + routeRes.backupCap);
-                corridorUsedFleet.set(
-                  cid,
-                  (corridorUsedFleet.get(cid) ?? 0) + Math.max(0, sLink.fleetCount || 0)
-                );
-              });
+              const usedBack = Math.max(0, granted - Math.min(granted, routeRes.primaryCap));
+              if (usedBack > EPS) {
+                rawRouteSplits.set(sLink.id, {
+                  primaryFlow: Math.min(granted, routeRes.primaryCap),
+                  backupFlow: usedBack,
+                  activeBackupCorridorIds: routeRes.activeBackupIds
+                });
+                routeRes.activeBackupIds.forEach(cid => {
+                  corridorUsedRate.set(cid, (corridorUsedRate.get(cid) ?? 0) + usedBack);
+                  corridorUsedFleet.set(
+                    cid,
+                    (corridorUsedFleet.get(cid) ?? 0) + Math.max(0, sLink.fleetCount || 0)
+                  );
+                });
+              }
             }
 
             standbyActivatedFrom[sLink.id] = {
@@ -1561,6 +2000,98 @@ export class SimEngine {
               `Day ${day}: Standby transfer ${sSrc.name} → ${sTgt.name} activated (${Math.round(granted).toLocaleString()} m³/d spillover from ${pSrc?.name || pLink.sourceId} → ${pTgt?.name || pLink.targetId}).`
             );
           }
+        });
+      }
+
+      // Stage 2C (only when diversionOrder === 'standby_link_first'):
+      // Any residual unmet primary route shortfall not picked up by standby links detours onto backupCorridorIds.
+      if (deferredBackupDetourLinkIds.size > 0) {
+        deferredBackupDetourLinkIds.forEach(linkId => {
+          const link = this.links.get(linkId);
+          if (!link) return;
+          const backupIds = getLinkBackupCorridorIds(link);
+          if (backupIds.length === 0) return;
+          const src = this.nodes.get(link.sourceId);
+          const tgt = this.nodes.get(link.targetId);
+          if (!src || !tgt || getNodeScheduleState(src).blocked || getNodeScheduleState(tgt).blocked) return;
+
+          const preReq = preRouteFlows.get(link.id) ?? 0;
+          const primAlloc = primaryRouteAllocated.get(link.id) ?? 0;
+          const alreadyDiverted = standbyDivertedByPrimary.get(link.id) ?? 0;
+          const residualUnmet = Math.max(0, preReq - primAlloc - alreadyDiverted);
+          if (residualUnmet <= EPS) return;
+
+          const matInfo = resolveLinkMaterial(link, src);
+          let srcCap = Infinity;
+          if (src.type !== 'external' && src.type !== 'null') {
+            const remSrc = Math.max(0, (startOfDayVolumes[src.id] ?? 0) - (committedRemoved.get(src.id) ?? 0));
+            srcCap = matInfo.bulkOUT > EPS ? remSrc / matInfo.bulkOUT : 0;
+          }
+          let tgtCap = Infinity;
+          if (tgt.type !== 'external' && tgt.type !== 'null') {
+            const tgtOverflow = tgt.overflowMode || this.defaultOverflowMode;
+            if (tgtOverflow !== 'overfill') {
+              if (tgt.strictSubRule === 'headroom_hold' && (this.headroomHoldStates.get(tgt.id) || false)) {
+                tgtCap = 0;
+              } else {
+                const tgtStart = startOfDayVolumes[tgt.id] ?? 0;
+                const tgtOutCredit = this.simSettings.sameDayDrainageCredit ? (committedRemoved.get(tgt.id) ?? 0) : 0;
+                const remHead = Math.max(0, tgt.capacity - (Math.max(0, tgtStart - tgtOutCredit) + (committedAdded.get(tgt.id) ?? 0)));
+                tgtCap = matInfo.bulkIN > EPS ? remHead / matInfo.bulkIN : 0;
+              }
+            }
+          }
+          const maxDetourCap =
+            link.backupCorridorRate !== undefined && Number.isFinite(link.backupCorridorRate)
+              ? Math.max(0, link.backupCorridorRate)
+              : residualUnmet;
+          const desired = Math.min(residualUnmet, maxDetourCap, srcCap, tgtCap);
+          if (desired <= EPS) return;
+
+          let routeAllowed = desired;
+          const linkFleet = Math.max(0, link.fleetCount || 0);
+          for (const cid of backupIds) {
+            const c = this.corridors.get(cid);
+            if (!c) continue;
+            const limits = getCorridorLimits(c);
+            if (limits.blocked) {
+              routeAllowed = 0;
+              break;
+            }
+            if (limits.rateCap !== undefined) {
+              routeAllowed = Math.min(routeAllowed, Math.max(0, limits.rateCap - (corridorUsedRate.get(cid) ?? 0)));
+            }
+            if (limits.fleetCap !== undefined && linkFleet > EPS) {
+              const remFleet = Math.max(0, limits.fleetCap - (corridorUsedFleet.get(cid) ?? 0));
+              if (remFleet <= EPS) {
+                routeAllowed = 0;
+                break;
+              }
+              if (linkFleet > remFleet + EPS) {
+                routeAllowed = Math.min(routeAllowed, desired * (remFleet / linkFleet));
+              }
+            }
+          }
+          if (routeAllowed <= EPS) return;
+
+          const curFlow = workingFlows.get(link.id) ?? 0;
+          workingFlows.set(link.id, curFlow + routeAllowed);
+          rawRouteSplits.set(link.id, {
+            primaryFlow: curFlow,
+            backupFlow: routeAllowed,
+            activeBackupCorridorIds: backupIds
+          });
+          backupIds.forEach(cid => {
+            corridorUsedRate.set(cid, (corridorUsedRate.get(cid) ?? 0) + routeAllowed);
+            corridorUsedFleet.set(cid, (corridorUsedFleet.get(cid) ?? 0) + linkFleet);
+          });
+          if (src.type !== 'null') {
+            committedRemoved.set(src.id, (committedRemoved.get(src.id) ?? 0) + routeAllowed * matInfo.bulkOUT);
+          }
+          if (tgt.type !== 'null') {
+            committedAdded.set(tgt.id, (committedAdded.get(tgt.id) ?? 0) + routeAllowed * matInfo.bulkIN);
+          }
+          routeBlockedLinks.delete(link.id);
         });
       }
 
@@ -1609,7 +2140,7 @@ export class SimEngine {
         const transferAmount = plannedTransfers.get(link.id) ?? 0;
 
         if (source && target && transferAmount > EPS) {
-          const { bulkIN, bulkOUT } = this.getLinkMaterial(link, source);
+          const { bulkIN, bulkOUT } = resolveLinkMaterial(link, source);
 
           if (source.type !== 'null') {
             nodeTotalRemoved.set(
@@ -1735,7 +2266,9 @@ export class SimEngine {
 
         // Primary links
         const routeSplit = linkRouteSplits[link.id];
-        if (calendarStoppedLinks.has(link.id) || routeBlockedLinks.has(link.id)) {
+        if (nonWorkingHaltedLinks.has(link.id)) {
+          linkStatuses[link.id] = 'idle';
+        } else if (calendarStoppedLinks.has(link.id) || routeBlockedLinks.has(link.id)) {
           linkStatuses[link.id] = 'blocked';
         } else if (transferCalEvt?.state === 'variable' && linkRate <= EPS) {
           linkStatuses[link.id] = 'blocked';
@@ -1746,7 +2279,9 @@ export class SimEngine {
         } else if (source.type !== 'external' && source.type !== 'null' && startVol <= EPS) {
           linkStatuses[link.id] = 'starved';
         } else if (actualFlow <= EPS) {
-          if (source.type === 'null' && isNullSourceStarved(source.id)) {
+          if (partialRuleNotes.has(link.id)) {
+            linkStatuses[link.id] = 'restricted';
+          } else if (source.type === 'null' && isNullSourceStarved(source.id)) {
             linkStatuses[link.id] = 'starved';
           } else {
             linkStatuses[link.id] = 'blocked';
@@ -1754,8 +2289,10 @@ export class SimEngine {
         } else if (routeSplit && routeSplit.backupFlow > EPS) {
           linkStatuses[link.id] = 'diverted';
         } else if (
+          globalHaulReducedLinks.has(link.id) ||
           routeRestrictedLinks.has(link.id) ||
           containerRestrictedLinks.has(link.id) ||
+          partialRuleNotes.has(link.id) ||
           actualFlow < preTargetFlow - EPS
         ) {
           linkStatuses[link.id] = 'restricted';
@@ -1932,8 +2469,148 @@ export class SimEngine {
         }
       });
 
+      // Assemble Per-Day Math Audit Record for Construction Engineering Transparency
+      const linksAudit: Record<string, LinkDayMathAudit> = {};
+      const containersAudit: Record<string, ContainerDayMathAudit> = {};
+      let totalDeliveredM3 = 0;
+
+      this.links.forEach(link => {
+        const role = getLinkRole(link);
+        const src = this.nodes.get(link.sourceId);
+        const tgt = this.nodes.get(link.targetId);
+        const mat = src ? resolveLinkMaterial(link, src) : { code: '', bulkIN: 1, bulkOUT: 1 };
+        const statedRate = baselineLinkRates.get(link.id) ?? link.dailyRate;
+        const afterCal = afterCalendarRates.get(link.id) ?? statedRate;
+        const afterWeather = activeLinkRates.get(link.id) ?? afterCal;
+        const afterSrc = role === 'primary' ? (afterSourceStockFlows.get(link.id) ?? 0) : afterWeather;
+        const afterCont = role === 'primary' ? (preRouteFlows.get(link.id) ?? afterSrc) : afterSrc;
+        const afterRoute = role === 'primary' ? (preTargetFlows.get(link.id) ?? afterCont) : afterCont;
+        const afterHeadroom = afterTargetHeadroomFlows.get(link.id) ?? (linkFlows[link.id] ?? 0);
+        const finalDelivered = linkFlows[link.id] ?? 0;
+        totalDeliveredM3 += finalDelivered;
+
+        let bindingConstraint = 'Full Stated Rate';
+        if (role === 'standby') {
+          bindingConstraint =
+            finalDelivered > EPS
+              ? 'Standby Spillover Active'
+              : standbyTriggeredLinks.has(link.id)
+              ? 'Standby Triggered (Constrained / Blocked)'
+              : 'Dormant Standby';
+        } else if (role === 'overflow') {
+          bindingConstraint =
+            finalDelivered > EPS
+              ? 'Transfer-Through Overflow Active'
+              : overflowTriggeredLinks.has(link.id)
+              ? 'Overflow Triggered (Backup Saturated / Blocked)'
+              : 'Dormant Overflow';
+        } else if (globalShutdownActive) {
+          bindingConstraint = 'Global Site Shutdown';
+        } else if (nonWorkingHaltedLinks.has(link.id)) {
+          bindingConstraint = dayCal.nonWorkingReason || 'Non-Working Day';
+        } else if (calendarStoppedLinks.has(link.id)) {
+          bindingConstraint = 'Transfer Calendar Stopped';
+        } else if (materialMismatchLinks.has(link.id)) {
+          bindingConstraint = 'Target Material Mismatch';
+        } else if (src && getNodeScheduleState(src).blocked) {
+          bindingConstraint = `Source Blocked (${src.name})`;
+        } else if (tgt && getNodeScheduleState(tgt).blocked) {
+          bindingConstraint = `Target Blocked (${tgt.name})`;
+        } else if (partialRuleNotes.has(link.id)) {
+          bindingConstraint = partialRuleNotes.get(link.id)!;
+        } else if (finalDelivered < afterRoute - EPS) {
+          if (tgt && this.headroomHoldStates.get(tgt.id)) {
+            bindingConstraint = `Target Headroom Hold (${tgt.name})`;
+          } else {
+            bindingConstraint = `Target Capacity Throttleback (${tgt?.name || link.targetId})`;
+          }
+        } else if (routeBlockedLinks.has(link.id)) {
+          bindingConstraint = 'Primary Route Corridor Blocked';
+        } else if (linkRouteSplits[link.id]?.backupFlow && linkRouteSplits[link.id].backupFlow > EPS) {
+          bindingConstraint =
+            finalDelivered < afterCont - EPS
+              ? 'Primary Route Capped + Partial Backup Detour'
+              : 'Backup Route Detour Active';
+        } else if (routeRestrictedLinks.has(link.id)) {
+          bindingConstraint = 'Route Corridor Rate/Fleet Cap';
+        } else if (containerRestrictedLinks.has(link.id)) {
+          bindingConstraint = 'Container Calendar Throughput Cap';
+        } else if (sourceStarvedEmptyLinks.has(link.id)) {
+          bindingConstraint = `Source Stockout (${src?.name || link.sourceId})`;
+        } else if (sourceStarvedPartialLinks.has(link.id)) {
+          bindingConstraint = `Source Low Stock (${src?.name || link.sourceId})`;
+        } else if (globalHaulReducedLinks.has(link.id)) {
+          bindingConstraint = `Global Weather Haul (${Math.round(getLinkHaulMultiplier(link) * 100)}%)`;
+        } else if (afterCal < statedRate - EPS) {
+          bindingConstraint = 'Calendar Variable Rate Override';
+        } else if (afterCal > statedRate + EPS) {
+          bindingConstraint = 'Calendar Boosted Rate';
+        }
+
+        linksAudit[link.id] = {
+          linkId: link.id,
+          role,
+          materialCode: mat.code,
+          statedRate,
+          afterCalendar: afterCal,
+          afterGlobalWeather: afterWeather,
+          afterSourceStock: afterSrc,
+          afterContainerCap: afterCont,
+          afterCorridorAndDetour: afterRoute,
+          afterTargetHeadroom: afterHeadroom,
+          afterPartialRule: finalDelivered,
+          finalDelivered,
+          bulkOutApplied: mat.bulkOUT,
+          bulkInApplied: mat.bulkIN,
+          sourceDeductedM3: src && src.type !== 'null' ? finalDelivered * mat.bulkOUT : 0,
+          targetDepositedM3: tgt && tgt.type !== 'null' ? finalDelivered * mat.bulkIN : 0,
+          bindingConstraint,
+          ...(partialRuleNotes.has(link.id) ? { partialRuleNote: partialRuleNotes.get(link.id) } : {})
+        };
+      });
+
+      this.nodes.forEach(node => {
+        const startVol = startOfDayVolumes[node.id] ?? 0;
+        const removed = nodeTotalRemoved.get(node.id) ?? 0;
+        const added = nodeTotalAdded.get(node.id) ?? 0;
+        const creditRemoved = this.simSettings.sameDayDrainageCredit ? removed : 0;
+        const effHeadroom =
+          node.type === 'external' || node.type === 'null'
+            ? 0
+            : Math.max(0, node.capacity - Math.max(0, startVol - creditRemoved));
+        containersAudit[node.id] = {
+          nodeId: node.id,
+          startVol,
+          outboundRemovedM3: removed,
+          sameDayCreditApplied: this.simSettings.sameDayDrainageCredit,
+          effectiveHeadroomM3: effHeadroom,
+          inboundDepositedM3: added,
+          overflowTransferredOutM3: overflowActiveNodes[node.id] ?? 0,
+          endVol: nodeVolumes[node.id] ?? 0,
+          headroomHoldLatched: this.headroomHoldStates.get(node.id) || false
+        };
+      });
+
+      const dayAudit: DayMathAudit = {
+        dateISO: dayCal.dateISO,
+        weekdayShort: dayCal.weekdayShort,
+        isWorkingDay: dayCal.isWorkingDay && !globalShutdownActive,
+        nonWorkingReason: globalShutdownActive ? 'Global Site Shutdown' : dayCal.nonWorkingReason,
+        siteShutdownActive: globalShutdownActive,
+        activeGlobalLabels,
+        effectiveHaulPct: globalShutdownActive ? 0 : Math.round(globalAllHaulMult * 100),
+        activeBulkingSummary,
+        totalDeliveredM3,
+        links: linksAudit,
+        containers: containersAudit
+      };
+
       frames.push({
         day,
+        dateISO: dayCal.dateISO,
+        isWorkingDay: dayCal.isWorkingDay && !globalShutdownActive,
+        nonWorkingReason: globalShutdownActive ? 'Global Site Shutdown' : dayCal.nonWorkingReason,
+        globalHaulMultiplier: globalShutdownActive ? 0 : globalAllHaulMult,
         nodeVolumes,
         linkFlows,
         corridorFlows,
@@ -1944,7 +2621,8 @@ export class SimEngine {
         linkStatuses,
         nodeStatuses,
         corridorStatuses,
-        alerts
+        alerts,
+        dayAudit
       });
     }
 

@@ -6,9 +6,16 @@ import {
   CalendarModel,
   CalendarEvent,
   CalendarTargetType,
+  ProjectSettings,
   SimFrame,
   GRAPH_LINE_COLORS
 } from '../../models/types';
+import {
+  dayIndexToDateISO,
+  evaluateCalendarDay,
+  formatFullDateWithWeekday,
+  formatShortDate
+} from '../../utils/dateUtils';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
 import { CalendarGantt, TIMELINE_THUMB_INSET } from './CalendarGantt';
 
@@ -17,6 +24,7 @@ interface PlaybackGraphProps {
   links: TransferLink[];
   corridors: RouteCorridor[];
   calendar: CalendarModel;
+  projectSettings: ProjectSettings;
   frames: SimFrame[];
   currentDay: number;
   isPlayback: boolean;
@@ -41,6 +49,7 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
   links,
   corridors,
   calendar,
+  projectSettings,
   frames,
   currentDay,
   isPlayback,
@@ -188,6 +197,74 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
     evt => currentDay >= 1 && currentDay >= evt.startDay && currentDay <= evt.endDay
   ).length;
 
+  const currentDateISO =
+    currentFrame?.dateISO ||
+    (currentDay >= 1 ? dayIndexToDateISO(projectSettings.startDate, currentDay) : projectSettings.startDate);
+  const currentDateFullLabel =
+    currentDay === 0
+      ? `Baseline (${formatShortDate(projectSettings.startDate)})`
+      : formatFullDateWithWeekday(currentDateISO);
+  const currentDateShortLabel =
+    currentDay === 0
+      ? `Baseline`
+      : formatShortDate(currentDateISO);
+
+  const svgShadingBands = React.useMemo(() => {
+    const usableW = Math.max(0, plotWidth - THUMB_INSET * 2);
+    const step = totalDays > 0 ? usableW / totalDays : 0;
+    const toX = (d: number) => THUMB_INSET + (totalDays > 0 ? (d / totalDays) * usableW : 0);
+
+    const bands: Array<{ x: number; width: number; fill: string }> = [];
+    // Non-working days / holidays merged into contiguous runs
+    let nwStart: number | null = null;
+    let nwHoliday = false;
+    const flushNw = (endDay: number) => {
+      if (nwStart === null) return;
+      const x1 = Math.max(0, toX(nwStart) - step * 0.5);
+      const x2 = Math.min(plotWidth, toX(endDay) + step * 0.5);
+      bands.push({
+        x: x1,
+        width: Math.max(1.5, x2 - x1),
+        fill: nwHoliday ? 'rgba(239, 68, 68, 0.09)' : 'rgba(148, 163, 184, 0.08)'
+      });
+      nwStart = null;
+    };
+    for (let d = 1; d <= totalDays; d++) {
+      const info = evaluateCalendarDay(projectSettings, d);
+      if (!info.isWorkingDay) {
+        const isHol = Boolean(info.holiday);
+        if (nwStart !== null && nwHoliday === isHol) {
+          // continue
+        } else {
+          flushNw(d - 1);
+          nwStart = d;
+          nwHoliday = isHol;
+        }
+      } else {
+        flushNw(d - 1);
+      }
+    }
+    flushNw(totalDays);
+
+    // Global site & weather events
+    for (const evt of calendar.events) {
+      if (evt.targetType !== 'global') continue;
+      if (evt.startDay > totalDays) continue;
+      const s = Math.max(1, evt.startDay);
+      const e = Math.min(totalDays, evt.endDay);
+      const x1 = Math.max(0, toX(s) - step * 0.5);
+      const x2 = Math.min(plotWidth, toX(e) + step * 0.5);
+      const fill =
+        evt.state === 'site_shutdown'
+          ? 'rgba(239, 68, 68, 0.14)'
+          : evt.state === 'weather_bulking'
+          ? 'rgba(129, 140, 248, 0.12)'
+          : 'rgba(245, 158, 11, 0.12)';
+      bands.push({ x: x1, width: Math.max(2, x2 - x1), fill });
+    }
+    return bands;
+  }, [plotWidth, totalDays, projectSettings, calendar.events, THUMB_INSET]);
+
   const rightCompensation = isCalendarOpen ? calendarScrollbarWidth : 0;
 
   if (!isGraphExpanded) {
@@ -236,8 +313,8 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
         >
           ▲
         </button>
-        <span style={{ fontSize: '12px', fontWeight: 600, color: '#f8fafc', minWidth: '60px', fontVariantNumeric: 'tabular-nums' }}>
-          Day {currentDay}
+        <span style={{ fontSize: '12px', fontWeight: 600, color: '#f8fafc', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
+          Day {currentDay} <span style={{ color: '#94a3b8', fontWeight: 500 }}>· {currentDateShortLabel}</span>
         </span>
         <div
           onClick={(e) => e.stopPropagation()}
@@ -257,8 +334,8 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
             style={{ flex: 1, accentColor: '#22c55e', cursor: 'pointer', height: '6px' }}
           />
         </div>
-        <span style={{ fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
-          Day {totalDays}
+        <span style={{ fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+          {formatShortDate(projectSettings.endDate)} (D{totalDays})
         </span>
         {calendar.events.length > 0 && (
           <span
@@ -390,14 +467,19 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '14px', fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '11px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
+          {currentDay >= 1 && currentFrame && currentFrame.isWorkingDay === false && (
+            <span style={{ color: '#ef4444', fontWeight: 600 }}>
+              Non-Working{currentFrame.nonWorkingReason ? ` (${currentFrame.nonWorkingReason})` : ''}
+            </span>
+          )}
           {currentDay >= 1 && activeEventsToday > 0 && (
             <span style={{ color: '#f59e0b', fontWeight: 600 }}>
-              {activeEventsToday} active override{activeEventsToday > 1 ? 's' : ''}
+              {activeEventsToday} active event{activeEventsToday > 1 ? 's' : ''}
             </span>
           )}
           <span>
-            Active Day: <strong style={{ color: '#f8fafc' }}>Day {currentDay}</strong> / {totalDays}
+            <strong style={{ color: '#f8fafc' }}>Day {currentDay}</strong> / {totalDays} · <span style={{ color: '#cbd5e1', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{currentDateFullLabel}</span>
           </span>
         </div>
       </div>
@@ -582,6 +664,18 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
                       }
                     }}
                   >
+                    {svgShadingBands.map((band, bIdx) => (
+                      <rect
+                        key={`band-${bIdx}`}
+                        x={band.x}
+                        y={10}
+                        width={band.width}
+                        height={140}
+                        fill={band.fill}
+                        pointerEvents="none"
+                      />
+                    ))}
+
                     {ticks.map(tickVal => {
                       const yFrac = (dynamicCeiling - tickVal) / dynamicCeiling;
                       const svgY = 10 + yFrac * 140;
@@ -731,6 +825,7 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
                 links={links}
                 corridors={corridors}
                 calendar={calendar}
+                projectSettings={projectSettings}
                 totalDays={totalDays}
                 currentDay={currentDay}
                 isPlayback={isPlayback}
@@ -780,16 +875,19 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
             color: '#94a3b8'
           }}
         >
-          <span style={{ fontWeight: 600, color: '#cbd5e1' }}>Simulation Day</span>
+          <span style={{ fontWeight: 600, color: '#cbd5e1', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {currentDateShortLabel}
+          </span>
           <span
             style={{
               fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
               fontVariantNumeric: 'tabular-nums',
               fontWeight: 700,
-              color: '#22c55e'
+              color: '#22c55e',
+              whiteSpace: 'nowrap'
             }}
           >
-            Day {currentDay} / {totalDays}
+            D{currentDay} / {totalDays}
           </span>
         </div>
 
@@ -835,9 +933,9 @@ export const PlaybackGraph: React.FC<PlaybackGraphProps> = ({
                 boxSizing: 'border-box'
               }}
             >
-              <span>Day 0</span>
-              <span>Day {Math.round(totalDays / 2)}</span>
-              <span>Day {totalDays}</span>
+              <span>D0 ({formatShortDate(projectSettings.startDate)})</span>
+              <span>D{Math.round(totalDays / 2)} ({formatShortDate(dayIndexToDateISO(projectSettings.startDate, Math.max(1, Math.round(totalDays / 2))))})</span>
+              <span>D{totalDays} ({formatShortDate(projectSettings.endDate)})</span>
             </div>
           </div>
         </div>

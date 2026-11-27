@@ -1,5 +1,18 @@
 import React, { useState } from 'react';
-import { ContainerNode, TransferLink, RouteCorridor, CalendarModel, SimFrame, MaterialDefinition, FlowStatus, getLinkCorridorIds, getLinkBackupCorridorIds, getLinkRole } from '../../models/types';
+import {
+  ContainerNode,
+  TransferLink,
+  RouteCorridor,
+  CalendarModel,
+  SimFrame,
+  MaterialDefinition,
+  FlowStatus,
+  ProjectSettings,
+  SimSettings,
+  getLinkCorridorIds,
+  getLinkBackupCorridorIds,
+  getLinkRole
+} from '../../models/types';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -8,6 +21,8 @@ interface ExportModalProps {
   links: TransferLink[];
   corridors?: RouteCorridor[];
   calendar?: CalendarModel;
+  projectSettings: ProjectSettings;
+  simSettings: SimSettings;
   frames: SimFrame[];
   materials: MaterialDefinition[];
 }
@@ -74,6 +89,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   links,
   corridors = [],
   calendar,
+  projectSettings,
+  simSettings,
   frames,
   materials
 }) => {
@@ -96,11 +113,46 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     lines.push(`# Material Transfer Simulation Comprehensive Model & Diagnostics Export`);
     lines.push(`# Exported: ${timestamp}`);
     lines.push(`# Scope: ${exportScope}`);
+    lines.push(`# Horizon: ${projectSettings.startDate} to ${projectSettings.endDate} (${Math.max(1, frames.length - 1)} days)`);
     lines.push(`# Color Key: Blue (#38bdf8) = Day 0 / Starved (lack of material), Green (#22c55e) = Full rate, Violet (#a855f7) = Diverted / Detour / Transfer-Through, Amber (#f59e0b) = Restricted rate, Red (#ef4444) = Blocked (capacity), Slate (#64748b) = Standby / Overflow (dormant)`);
     lines.push('');
 
-    // Model configuration (materials, nodes and links)
+    // Model configuration (settings, materials, nodes, corridors, links, calendar)
     if (exportScope === 'all' || exportScope === 'model') {
+      // 0a. Project Settings
+      lines.push('# SECTION: PROJECT SETTINGS');
+      lines.push('Key,Value');
+      lines.push(`ProjectName,"${(projectSettings.projectName || '').replace(/"/g, '""')}"`);
+      lines.push(`StartDate,${projectSettings.startDate}`);
+      lines.push(`EndDate,${projectSettings.endDate}`);
+      lines.push(`WorkingDays,${projectSettings.workingDays.map(w => (w ? '1' : '0')).join('|')}`);
+      lines.push(`ProjectNotes,"${(projectSettings.projectNotes || '').replace(/"/g, '""')}"`);
+      lines.push('');
+
+      // 0b. Project Holidays
+      lines.push('# SECTION: PROJECT HOLIDAYS');
+      lines.push('HolidayID,StartDate,EndDate,Name');
+      (projectSettings.holidays || []).forEach(h => {
+        const escapedHolName = `"${(h.name || '').replace(/"/g, '""')}"`;
+        lines.push(`${h.id},${h.startDate},${h.endDate || h.startDate},${escapedHolName}`);
+      });
+      lines.push('');
+
+      // 0c. Sim Settings
+      lines.push('# SECTION: SIM SETTINGS');
+      lines.push('Key,Value');
+      lines.push(`AllocationPolicy,${simSettings.allocationPolicy}`);
+      lines.push(`PartialDeliveryPolicy,${simSettings.partialDeliveryPolicy}`);
+      lines.push(`TruckPayloadM3,${simSettings.truckPayloadM3}`);
+      lines.push(`MinBatchPct,${simSettings.minBatchPct}`);
+      lines.push(`SameDayDrainageCredit,${simSettings.sameDayDrainageCredit}`);
+      lines.push(`BulkingMode,${simSettings.bulkingMode}`);
+      lines.push(`DiversionOrder,${simSettings.diversionOrder}`);
+      lines.push(`AllowOvertimeOnNonWorkingDays,${simSettings.allowOvertimeOnNonWorkingDays}`);
+      lines.push(`DefaultHeadroomThresholdM3,${simSettings.defaultHeadroomThresholdM3}`);
+      lines.push(`DefaultOverflowTriggerPct,${simSettings.defaultOverflowTriggerPct}`);
+      lines.push('');
+
       // 1. Material definitions and bulking factors
       lines.push('# SECTION: MATERIALS');
       lines.push('Code,Name,BulkIN,BulkOUT');
@@ -185,12 +237,16 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
       // 6. Calendar Events (children of Calendar)
       lines.push('# SECTION: CALENDAR EVENTS');
-      lines.push('EventID,CalendarID,TargetType,TargetID,StartDay,EndDay,State,RateValue,Label,Notes');
+      lines.push('EventID,CalendarID,TargetType,TargetID,StartDay,EndDay,State,RateValue,Label,Notes,HaulRatePct,BulkInMult,BulkOutMult,AffectedMaterials');
       (cal.events || []).forEach(evt => {
         const rateStr = evt.rateValue !== undefined && Number.isFinite(evt.rateValue) ? `${evt.rateValue}` : '';
         const escapedLabel = `"${(evt.label || '').replace(/"/g, '""')}"`;
         const escapedEvtNotes = `"${(evt.notes || '').replace(/"/g, '""')}"`;
-        lines.push(`${evt.id},${evt.calendarId || cal.id},${evt.targetType},${evt.targetId},${evt.startDay},${evt.endDay},${evt.state},${rateStr},${escapedLabel},${escapedEvtNotes}`);
+        const haulStr = evt.haulRatePct !== undefined && Number.isFinite(evt.haulRatePct) ? `${evt.haulRatePct}` : '';
+        const bulkInStr = evt.bulkInMultiplier !== undefined && Number.isFinite(evt.bulkInMultiplier) ? `${evt.bulkInMultiplier}` : '';
+        const bulkOutStr = evt.bulkOutMultiplier !== undefined && Number.isFinite(evt.bulkOutMultiplier) ? `${evt.bulkOutMultiplier}` : '';
+        const affectedStr = evt.affectedMaterials && evt.affectedMaterials.length > 0 ? `"${evt.affectedMaterials.join('|')}"` : '""';
+        lines.push(`${evt.id},${evt.calendarId || cal.id},${evt.targetType},${evt.targetId},${evt.startDay},${evt.endDay},${evt.state},${rateStr},${escapedLabel},${escapedEvtNotes},${haulStr},${bulkInStr},${bulkOutStr},${affectedStr}`);
       });
       lines.push('');
     }
@@ -199,8 +255,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     if (exportScope === 'all' || exportScope === 'telemetry') {
       // 4. Daily Container Records with SimState, Colour, ColourHex, and StateDescription
       lines.push('# SECTION: SIMULATION DAILY NODE VOLUMES');
-      lines.push('Day,NodeID,NodeName,NodeType,MaterialType,BulkIN,BulkOUT,OverflowMode,StrictSubRule,Volume_m3,Capacity_m3,Utilization_pct,OverflowOut_m3,SimState,Colour,ColourHex,StateDescription');
+      lines.push('Day,Date,WorkingDay,NodeID,NodeName,NodeType,MaterialType,BulkIN,BulkOUT,OverflowMode,StrictSubRule,Volume_m3,Capacity_m3,Utilization_pct,OverflowOut_m3,SimState,Colour,ColourHex,StateDescription');
       frames.forEach(frame => {
+        const dateStr = frame.dateISO || '';
+        const workStr = frame.day === 0 ? 'baseline' : frame.isWorkingDay === false ? 'false' : 'true';
         Object.entries(frame.nodeVolumes || {}).forEach(([nodeId, volume]) => {
           const node = nodeMap.get(nodeId);
           const name = node ? `"${node.name.replace(/"/g, '""')}"` : nodeId;
@@ -218,15 +276,17 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const nodeStatus: FlowStatus = frame.nodeStatuses?.[nodeId] ?? (frame.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(nodeStatus, frame.day);
 
-          lines.push(`${frame.day},${nodeId},${name},${type},"${matCode}",${bulkIn},${bulkOut},${overflow},${strictSub},${Math.round(volume)},${cap},${pct}%,${overflowOut},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+          lines.push(`${frame.day},${dateStr},${workStr},${nodeId},${name},${type},"${matCode}",${bulkIn},${bulkOut},${overflow},${strictSub},${Math.round(volume)},${cap},${pct}%,${overflowOut},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
         });
       });
       lines.push('');
 
       // 5. Daily Transfer Records with SimState, Colour, ColourHex, and StateDescription
       lines.push('# SECTION: SIMULATION DAILY LINK FLOWS');
-      lines.push('Day,LinkID,LinkRole,SourceNodeID,SourceName,TargetNodeID,TargetName,PlannedRate_m3d,Transferred_m3,PrimaryRouteFlow_m3,DetourRouteFlow_m3,SimState,Colour,ColourHex,StateDescription');
+      lines.push('Day,Date,WorkingDay,LinkID,LinkRole,SourceNodeID,SourceName,TargetNodeID,TargetName,PlannedRate_m3d,Transferred_m3,PrimaryRouteFlow_m3,DetourRouteFlow_m3,SimState,Colour,ColourHex,StateDescription');
       frames.forEach(frame => {
+        const dateStr = frame.dateISO || '';
+        const workStr = frame.day === 0 ? 'baseline' : frame.isWorkingDay === false ? 'false' : 'true';
         Object.entries(frame.linkFlows || {}).forEach(([linkId, flow]) => {
           const link = linkMap.get(linkId);
           const linkRole = link ? getLinkRole(link) : 'primary';
@@ -244,7 +304,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const linkStatus: FlowStatus = frame.linkStatuses?.[linkId] ?? (frame.day === 0 ? 'frozen' : 'idle');
           const meta = getStatusMeta(linkStatus, frame.day);
 
-          lines.push(`${frame.day},${linkId},${linkRole},${src},${srcName},${tgt},${tgtName},${plannedRate},${Math.round(flow)},${primaryFlow},${detourFlow},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
+          lines.push(`${frame.day},${dateStr},${workStr},${linkId},${linkRole},${src},${srcName},${tgt},${tgtName},${plannedRate},${Math.round(flow)},${primaryFlow},${detourFlow},${meta.state},${meta.colour},${meta.hex},"${meta.label}"`);
         });
       });
       lines.push('');
@@ -346,6 +406,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     };
 
     if (exportScope === 'all' || exportScope === 'model') {
+      payload.projectSettings = projectSettings;
+      payload.simSettings = simSettings;
       payload.materials = materials;
       payload.nodes = nodes.map(n => ({
         id: n.id,
@@ -405,6 +467,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           endDay: evt.endDay,
           state: evt.state,
           ...(evt.rateValue !== undefined ? { rateValue: evt.rateValue } : {}),
+          ...(evt.haulRatePct !== undefined ? { haulRatePct: evt.haulRatePct } : {}),
+          ...(evt.bulkInMultiplier !== undefined ? { bulkInMultiplier: evt.bulkInMultiplier } : {}),
+          ...(evt.bulkOutMultiplier !== undefined ? { bulkOutMultiplier: evt.bulkOutMultiplier } : {}),
+          ...(evt.affectedMaterials && evt.affectedMaterials.length > 0 ? { affectedMaterials: [...evt.affectedMaterials] } : {}),
           ...(evt.label ? { label: evt.label } : {}),
           ...(evt.notes ? { notes: evt.notes } : {})
         }))
@@ -488,6 +554,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
         return {
           day: f.day,
+          ...(f.dateISO ? { dateISO: f.dateISO } : {}),
+          ...(f.isWorkingDay !== undefined ? { isWorkingDay: f.isWorkingDay } : {}),
+          ...(f.nonWorkingReason ? { nonWorkingReason: f.nonWorkingReason } : {}),
+          ...(f.globalHaulMultiplier !== undefined ? { globalHaulMultiplier: f.globalHaulMultiplier } : {}),
           containers: dayContainers,
           transfers: dayTransfers,
           corridors: dayCorridors,

@@ -9,8 +9,16 @@ import {
   CalendarEvent,
   Point,
   getLinkCorridorIds,
-  getLinkBackupCorridorIds
+  getLinkBackupCorridorIds,
+  ProjectSettings,
+  SimSettings,
+  SettingsPresetPayload,
+  createDefaultProjectSettings,
+  createDefaultSimSettings,
+  normalizeProjectSettings,
+  normalizeSimSettings
 } from '../models/types';
+import { computeInclusiveDays } from '../utils/dateUtils';
 import { SimEngine, OverflowMode, StrictSubRule } from '../simulation/SimEngine';
 
 export class CanvasViewModel {
@@ -23,6 +31,8 @@ export class CanvasViewModel {
     events: []
   };
   private materials: MaterialDefinition[];
+  private projectSettings: ProjectSettings = createDefaultProjectSettings();
+  private simSettings: SimSettings = createDefaultSimSettings();
   private frames: SimFrame[] = [];
   private currentFrameIndex: number = 0;
   private isPlayback: boolean = false;
@@ -202,16 +212,117 @@ export class CanvasViewModel {
     this.recalculateSimulation();
   }
 
+  public getTotalDays(): number {
+    return computeInclusiveDays(this.projectSettings.startDate, this.projectSettings.endDate);
+  }
+
+  public getProjectSettings(): ProjectSettings {
+    return {
+      ...this.projectSettings,
+      workingDays: [...this.projectSettings.workingDays] as ProjectSettings['workingDays'],
+      holidays: this.projectSettings.holidays.map(h => ({ ...h }))
+    };
+  }
+
+  public updateProjectSettings(updates: Partial<ProjectSettings>): ProjectSettings {
+    this.projectSettings = normalizeProjectSettings({
+      ...this.projectSettings,
+      ...updates,
+      workingDays: updates.workingDays ? [...updates.workingDays] as ProjectSettings['workingDays'] : this.projectSettings.workingDays,
+      holidays: updates.holidays ? updates.holidays.map(h => ({ ...h })) : this.projectSettings.holidays
+    });
+    this.recalculateSimulation();
+    return this.getProjectSettings();
+  }
+
+  public resetProjectSettings(): ProjectSettings {
+    this.projectSettings = createDefaultProjectSettings();
+    this.recalculateSimulation();
+    return this.getProjectSettings();
+  }
+
+  public getSimSettings(): SimSettings {
+    return { ...this.simSettings };
+  }
+
+  public updateSimSettings(updates: Partial<SimSettings>): SimSettings {
+    this.simSettings = normalizeSimSettings({
+      ...this.simSettings,
+      ...updates
+    });
+    this.recalculateSimulation();
+    return this.getSimSettings();
+  }
+
+  public resetSimSettings(): SimSettings {
+    this.simSettings = createDefaultSimSettings();
+    this.recalculateSimulation();
+    return this.getSimSettings();
+  }
+
+  public applySettingsPreset(preset: SettingsPresetPayload): {
+    appliedProject: boolean;
+    appliedSim: boolean;
+    appliedGlobalEvents: number;
+  } {
+    let appliedProject = false;
+    let appliedSim = false;
+    let appliedGlobalEvents = 0;
+
+    if (preset.projectSettings) {
+      this.projectSettings = normalizeProjectSettings(preset.projectSettings);
+      appliedProject = true;
+    }
+    if (preset.simSettings) {
+      this.simSettings = normalizeSimSettings(preset.simSettings);
+      appliedSim = true;
+    }
+    if (Array.isArray(preset.globalEvents)) {
+      const totalDays = this.getTotalDays();
+      const nonGlobalEvents = this.calendar.events.filter(e => e.targetType !== 'global');
+      const normalizedGlobals: CalendarEvent[] = preset.globalEvents
+        .filter(e => e && e.targetType === 'global')
+        .map((e, idx) => {
+          const s = Math.max(1, Math.min(totalDays, Math.round(e.startDay || 1)));
+          const end = Math.max(s, Math.min(totalDays, Math.round(e.endDay || s)));
+          return {
+            ...e,
+            id: e.id || `global-evt-${Date.now()}-${idx}`,
+            calendarId: this.calendar.id,
+            targetType: 'global' as const,
+            targetId: 'site',
+            startDay: s,
+            endDay: end
+          };
+        });
+      this.calendar.events = [...nonGlobalEvents, ...normalizedGlobals];
+      appliedGlobalEvents = normalizedGlobals.length;
+    }
+
+    this.recalculateSimulation();
+    return { appliedProject, appliedSim, appliedGlobalEvents };
+  }
+
   public loadModel(
     nodes: ContainerNode[],
     links: TransferLink[],
     materials?: MaterialDefinition[],
     corridors?: RouteCorridor[],
-    calendar?: CalendarModel
+    calendar?: CalendarModel,
+    projectSettings?: ProjectSettings,
+    simSettings?: SimSettings
   ): void {
     if (materials && materials.length > 0) {
       this.materials = materials;
     }
+    this.projectSettings = projectSettings
+      ? normalizeProjectSettings(projectSettings)
+      : createDefaultProjectSettings();
+    this.simSettings = simSettings
+      ? normalizeSimSettings(simSettings)
+      : createDefaultSimSettings();
+
+    const totalDays = this.getTotalDays();
     const validNodeIds = new Set(nodes.map(n => n.id));
     this.nodes = nodes;
     const validCorridorIds = new Set((corridors || []).map(c => c.id));
@@ -240,17 +351,23 @@ export class CanvasViewModel {
       const calId = calendar.id || 'calendar-1';
       const validEvents = (calendar.events || [])
         .filter(evt => {
+          if (evt.targetType === 'global') return true;
           if (evt.targetType === 'container') return validNodeIds.has(evt.targetId);
           if (evt.targetType === 'transfer') return validLinkIds.has(evt.targetId);
           if (evt.targetType === 'route') return validCorridorIds.has(evt.targetId);
           return false;
         })
-        .map(evt => ({
-          ...evt,
-          calendarId: evt.calendarId || calId,
-          startDay: Math.max(1, Math.min(30, Math.round(evt.startDay))),
-          endDay: Math.max(Math.max(1, Math.min(30, Math.round(evt.startDay))), Math.min(30, Math.round(evt.endDay)))
-        }));
+        .map(evt => {
+          const s = Math.max(1, Math.min(totalDays, Math.round(evt.startDay)));
+          const e = Math.max(s, Math.min(totalDays, Math.round(evt.endDay)));
+          return {
+            ...evt,
+            targetId: evt.targetType === 'global' ? 'site' : evt.targetId,
+            calendarId: evt.calendarId || calId,
+            startDay: s,
+            endDay: e
+          };
+        });
       this.calendar = {
         id: calId,
         name: calendar.name || 'Project Schedule',
@@ -270,16 +387,22 @@ export class CanvasViewModel {
   }
 
   public recalculateSimulation(): void {
+    const totalDays = this.getTotalDays();
     const engine = new SimEngine(
       this.nodes,
       this.links,
       this.materials,
-      30,
+      totalDays,
       this.overflowMode,
       this.corridors,
-      this.calendar
+      this.calendar,
+      this.projectSettings,
+      this.simSettings
     );
     this.frames = engine.runSimulation();
+    if (this.currentFrameIndex >= this.frames.length) {
+      this.currentFrameIndex = Math.max(0, this.frames.length - 1);
+    }
   }
 
   public getNodes(): ContainerNode[] { return this.nodes; }
@@ -288,7 +411,10 @@ export class CanvasViewModel {
   public getCalendar(): CalendarModel {
     return {
       ...this.calendar,
-      events: this.calendar.events.map(e => ({ ...e }))
+      events: this.calendar.events.map(e => ({
+        ...e,
+        ...(e.affectedMaterials ? { affectedMaterials: [...e.affectedMaterials] } : {})
+      }))
     };
   }
   public getFrames(): SimFrame[] { return this.frames; }
@@ -574,10 +700,12 @@ export class CanvasViewModel {
   }
 
   public addCalendarEvent(event: Omit<CalendarEvent, 'calendarId'> & { calendarId?: string }): CalendarEvent {
-    const normalizedStart = Math.max(1, Math.min(30, Math.round(event.startDay)));
-    const normalizedEnd = Math.max(normalizedStart, Math.min(30, Math.round(event.endDay)));
+    const totalDays = this.getTotalDays();
+    const normalizedStart = Math.max(1, Math.min(totalDays, Math.round(event.startDay)));
+    const normalizedEnd = Math.max(normalizedStart, Math.min(totalDays, Math.round(event.endDay)));
     const newEvent: CalendarEvent = {
       ...event,
+      targetId: event.targetType === 'global' ? 'site' : event.targetId,
       calendarId: event.calendarId || this.calendar.id,
       startDay: normalizedStart,
       endDay: normalizedEnd
@@ -590,9 +718,13 @@ export class CanvasViewModel {
   public updateCalendarEvent(eventId: string, updates: Partial<CalendarEvent>): void {
     const evt = this.calendar.events.find(e => e.id === eventId);
     if (!evt) return;
+    const totalDays = this.getTotalDays();
     Object.assign(evt, updates);
-    evt.startDay = Math.max(1, Math.min(30, Math.round(evt.startDay)));
-    evt.endDay = Math.max(evt.startDay, Math.min(30, Math.round(evt.endDay)));
+    if (evt.targetType === 'global') {
+      evt.targetId = 'site';
+    }
+    evt.startDay = Math.max(1, Math.min(totalDays, Math.round(evt.startDay)));
+    evt.endDay = Math.max(evt.startDay, Math.min(totalDays, Math.round(evt.endDay)));
     this.recalculateSimulation();
   }
 

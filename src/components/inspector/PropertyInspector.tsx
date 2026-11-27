@@ -14,10 +14,18 @@ import {
   LinkRole,
   DiversionTrigger,
   ClipboardData,
+  ProjectSettings,
+  SimSettings,
   getLinkCorridorIds,
   getLinkBackupCorridorIds,
   getLinkRole
 } from '../../models/types';
+import {
+  dateISOToDayIndex,
+  dayIndexToDateISO,
+  formatFullDateWithWeekday,
+  formatShortDate
+} from '../../utils/dateUtils';
 import { CanvasViewModel } from '../../viewmodel/CanvasViewModel';
 import { resolveOrderedCorridorChain } from '../canvas/pipeRouter';
 import { MaterialDrawer } from './MaterialDrawer';
@@ -26,6 +34,9 @@ interface PropertyInspectorProps {
   vm: CanvasViewModel;
   isPlayback: boolean;
   currentDay: number;
+  totalDays: number;
+  projectSettings: ProjectSettings;
+  simSettings: SimSettings;
   currentFrame: SimFrame;
   selectedNodeIds: string[];
   selectedLinkIds: string[];
@@ -68,6 +79,9 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   vm,
   isPlayback,
   currentDay,
+  totalDays,
+  projectSettings,
+  simSettings,
   currentFrame,
   selectedNodeIds,
   selectedLinkIds,
@@ -104,6 +118,10 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   onClearSelection,
   onMaterialsUpdated,
 }) => {
+  const [showSiteAudit, setShowSiteAudit] = React.useState(false);
+  const [showContainerAudit, setShowContainerAudit] = React.useState(true);
+  const [showLinkAudit, setShowLinkAudit] = React.useState(true);
+
   const isCalendarEventSelected = Boolean(selectedCalendarEvent);
   const isPureNode = !isCalendarEventSelected && selectedNodeIds.length > 0 && selectedLinkIds.length === 0 && selectedCorridorIds.length === 0;
   const isPureSingleLink = !isCalendarEventSelected && selectedNodeIds.length === 0 && selectedLinkIds.length === 1 && selectedCorridorIds.length === 0;
@@ -111,6 +129,13 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
   const isMixedOrMultiOther = !isCalendarEventSelected && hasSelection && !isPureNode && !isPureSingleLink && !isPureSingleCorridor;
 
   const getCalendarTargetInfo = (evt: CalendarEvent): { typeLabel: string; name: string; baseSummary: string } => {
+    if (evt.targetType === 'global') {
+      return {
+        typeLabel: 'Global / Site',
+        name: 'Site-Wide Schedule & Weather',
+        baseSummary: 'Applies across all site containers and transfers'
+      };
+    }
     if (evt.targetType === 'container') {
       const node = nodes.find(n => n.id === evt.targetId);
       const baseStatus = node?.status || 'active';
@@ -161,10 +186,10 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
     );
     const nextStart = others.reduce(
       (minStart, o) => (o.startDay > evt.endDay ? Math.min(minStart, o.startDay) : minStart),
-      31
+      totalDays + 1
     );
     const minAllowed = prevEnd + 1;
-    const maxAllowed = nextStart - 1;
+    const maxAllowed = Math.min(totalDays, nextStart - 1);
     const s = Math.max(minAllowed, Math.min(maxAllowed, Math.round(desiredStart)));
     const e = Math.max(s, Math.min(maxAllowed, Math.round(desiredEnd)));
     return { startDay: s, endDay: e };
@@ -368,10 +393,109 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '16px 20px 20px 20px', boxSizing: 'border-box' }}>
       {isPlayback ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155' }}>
-            <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600, marginBottom: '4px' }}>TIMELINE STATUS</div>
-            <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#22c55e' }}>Day {currentDay} of 30</div>
-          </div>
+          {(() => {
+            const currentDateISO =
+              currentFrame?.dateISO ||
+              (currentDay >= 1 ? dayIndexToDateISO(projectSettings.startDate, currentDay) : projectSettings.startDate);
+            const dateLabel =
+              currentDay === 0
+                ? `Baseline (${formatShortDate(projectSettings.startDate)})`
+                : formatFullDateWithWeekday(currentDateISO);
+            const audit = currentFrame?.dayAudit;
+            const totalMovedToday = Object.values(currentFrame?.linkFlows || {}).reduce((s, v) => s + v, 0);
+            const haulPct = Math.round((currentFrame?.globalHaulMultiplier ?? 1) * 100);
+            return (
+              <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>TIMELINE STATUS</span>
+                  {currentDay >= 1 && (
+                    <span style={{ fontSize: '10px', fontWeight: 700, color: currentFrame?.isWorkingDay === false ? '#ef4444' : '#22c55e' }}>
+                      {currentFrame?.isWorkingDay === false ? 'NON-WORKING' : 'WORKING DAY'}
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#22c55e', fontVariantNumeric: 'tabular-nums' }}>
+                  Day {currentDay} of {totalDays}
+                </div>
+                <div style={{ fontSize: '11px', color: '#cbd5e1', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontVariantNumeric: 'tabular-nums' }}>
+                  {dateLabel}
+                </div>
+                {currentDay >= 1 && currentFrame?.nonWorkingReason && (
+                  <div style={{ fontSize: '11px', color: '#fca5a5' }}>
+                    Reason: {currentFrame.nonWorkingReason}
+                  </div>
+                )}
+                {currentDay >= 1 && haulPct !== 100 && (
+                  <div style={{ fontSize: '11px', color: '#fde68a', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                    Global Haul Modifier: {haulPct}%
+                  </div>
+                )}
+                {audit && audit.activeGlobalLabels.length > 0 && (
+                  <div style={{ fontSize: '11px', color: '#38bdf8' }}>
+                    Global: {audit.activeGlobalLabels.join(' · ')}
+                  </div>
+                )}
+                {audit && audit.activeBulkingSummary.length > 0 && (
+                  <div style={{ fontSize: '10px', color: '#c7d2fe', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                    Bulking: {audit.activeBulkingSummary.join(' · ')}
+                  </div>
+                )}
+
+                {/* Collapsible Site Day Math Audit */}
+                <button
+                  type="button"
+                  onClick={() => setShowSiteAudit(v => !v)}
+                  style={{
+                    marginTop: '4px',
+                    alignSelf: 'flex-start',
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    color: '#38bdf8',
+                    fontSize: '11px',
+                    fontWeight: 600,
+                    cursor: 'pointer'
+                  }}
+                >
+                  {showSiteAudit ? '▾ Hide Day Math Summary' : '▸ Show Day Math Summary'}
+                </button>
+                {showSiteAudit && (
+                  <div style={{ backgroundColor: '#0b1120', border: '1px solid #1e293b', borderRadius: '4px', padding: '8px 9px', fontSize: '10px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontVariantNumeric: 'tabular-nums', color: '#cbd5e1', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Total Site Flow:</span>
+                      <span style={{ color: '#22c55e', fontWeight: 700 }}>{Math.round(totalMovedToday).toLocaleString()} m³</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Allocation:</span>
+                      <span>{simSettings.allocationPolicy}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Partial Delivery:</span>
+                      <span>
+                        {simSettings.partialDeliveryPolicy === 'discrete_loads'
+                          ? `discrete (${simSettings.truckPayloadM3} m³)`
+                          : simSettings.partialDeliveryPolicy === 'min_batch'
+                          ? `min batch (${simSettings.minBatchPct}%)`
+                          : 'continuous'}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Same-Day Drainage:</span>
+                      <span>{simSettings.sameDayDrainageCredit ? 'credited' : 'conservative'}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Bulking Mode:</span>
+                      <span>{simSettings.bulkingMode === 'bank_volume_only' ? '1.0 neutral' : 'strict IN/OUT'}</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Diversion Order:</span>
+                      <span>{simSettings.diversionOrder === 'standby_link_first' ? 'standby first' : 'backup route first'}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Selected Calendar Event Read-Only Inspection in Playback */}
           {selectedCalendarEvent && (() => {
@@ -380,6 +504,8 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               currentDay >= 1 &&
               currentDay >= selectedCalendarEvent.startDay &&
               currentDay <= selectedCalendarEvent.endDay;
+            const startIso = dayIndexToDateISO(projectSettings.startDate, selectedCalendarEvent.startDay);
+            const endIso = dayIndexToDateISO(projectSettings.startDate, selectedCalendarEvent.endDay);
             return (
               <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -390,15 +516,21 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     {isActiveToday ? 'ACTIVE TODAY' : 'INACTIVE'}
                   </span>
                 </div>
-                <div style={{ fontSize: '13px', fontWeight: 700, color: '#f8fafc' }}>{info.name}</div>
+                <div style={{ fontSize: '13px', fontWeight: 700, color: '#f8fafc' }}>{selectedCalendarEvent.label || info.name}</div>
+                {selectedCalendarEvent.notes && (
+                  <div style={{ padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
+                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>DESCRIPTION</div>
+                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedCalendarEvent.notes}</div>
+                  </div>
+                )}
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
                   <span>Schedule Window:</span>
-                  <span style={{ fontWeight: 600 }}>Day {selectedCalendarEvent.startDay} – Day {selectedCalendarEvent.endDay}</span>
+                  <span style={{ fontWeight: 600 }}>D{selectedCalendarEvent.startDay}–D{selectedCalendarEvent.endDay} ({formatShortDate(startIso)}–{formatShortDate(endIso)})</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1' }}>
                   <span>State Override:</span>
-                  <span style={{ fontWeight: 700, textTransform: 'uppercase', color: selectedCalendarEvent.state === 'blocked' || selectedCalendarEvent.state === 'stopped' ? '#ef4444' : selectedCalendarEvent.state === 'restricted' || selectedCalendarEvent.state === 'variable' ? '#f59e0b' : '#22c55e' }}>
-                    {selectedCalendarEvent.state}
+                  <span style={{ fontWeight: 700, textTransform: 'uppercase', color: selectedCalendarEvent.state === 'blocked' || selectedCalendarEvent.state === 'stopped' || selectedCalendarEvent.state === 'site_shutdown' ? '#ef4444' : selectedCalendarEvent.state === 'restricted' || selectedCalendarEvent.state === 'variable' || selectedCalendarEvent.state === 'weather_haul' || selectedCalendarEvent.state === 'combined_weather' ? '#f59e0b' : selectedCalendarEvent.state === 'weather_bulking' ? '#818cf8' : '#22c55e' }}>
+                    {selectedCalendarEvent.state.replace(/_/g, ' ')}
                   </span>
                 </div>
                 {(selectedCalendarEvent.state === 'variable' || selectedCalendarEvent.state === 'restricted') && (
@@ -407,10 +539,16 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     <span style={{ fontWeight: 600 }}>{Math.round(selectedCalendarEvent.rateValue ?? 0).toLocaleString()} m³/d</span>
                   </div>
                 )}
-                {selectedCalendarEvent.notes && (
-                  <div style={{ marginTop: '2px', padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
-                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>NOTES</div>
-                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedCalendarEvent.notes}</div>
+                {(selectedCalendarEvent.state === 'weather_haul' || selectedCalendarEvent.state === 'combined_weather') && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
+                    <span>Haul Rate Modifier:</span>
+                    <span style={{ fontWeight: 600 }}>{Math.round(selectedCalendarEvent.haulRatePct ?? 50)}%</span>
+                  </div>
+                )}
+                {(selectedCalendarEvent.state === 'weather_bulking' || selectedCalendarEvent.state === 'combined_weather') && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>
+                    <span>Bulking Multipliers:</span>
+                    <span style={{ fontWeight: 600 }}>IN ×{(selectedCalendarEvent.bulkInMultiplier ?? 1).toFixed(2)} · OUT ×{(selectedCalendarEvent.bulkOutMultiplier ?? 1).toFixed(2)}</span>
                   </div>
                 )}
               </div>
@@ -452,6 +590,12 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>CONTAINER TELEMETRY</div>
                 <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#f8fafc' }}>{singleSelectedNode.name}</div>
+                {singleSelectedNode.notes && (
+                  <div style={{ padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
+                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>DESCRIPTION</div>
+                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{singleSelectedNode.notes}</div>
+                  </div>
+                )}
                 
                 <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 8px', borderRadius: '4px', backgroundColor: statusConfig.bg, border: `1px solid ${statusConfig.border}`, color: statusConfig.color, fontSize: '11px', fontWeight: 600, width: 'fit-content' }}>
                   <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: statusConfig.color }} />
@@ -487,12 +631,59 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     <div style={{ width: `${Math.min(100, Math.max(0, fillPct))}%`, height: '100%', backgroundColor: isOverfilled ? '#ef4444' : (singleSelectedNode.type === 'excavation' ? '#0d9488' : singleSelectedNode.type === 'stockpile' ? '#b45309' : '#475569') }} />
                   </div>
                 )}
-                {singleSelectedNode.notes && (
-                  <div style={{ marginTop: '2px', padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
-                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>NOTES</div>
-                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{singleSelectedNode.notes}</div>
-                  </div>
-                )}
+
+                {/* Per-Day Container Math Audit */}
+                {currentFrame?.dayAudit?.containers?.[singleSelectedNode.id] && (() => {
+                  const ca = currentFrame.dayAudit.containers[singleSelectedNode.id];
+                  return (
+                    <div style={{ borderTop: '1px solid #1e293b', paddingTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <button
+                        type="button"
+                        onClick={() => setShowContainerAudit(v => !v)}
+                        style={{ alignSelf: 'flex-start', background: 'none', border: 'none', padding: 0, color: '#38bdf8', fontSize: '11px', fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        {showContainerAudit ? '▾ Hide Day Math Audit' : '▸ Show Day Math Audit'}
+                      </button>
+                      {showContainerAudit && (
+                        <div style={{ backgroundColor: '#0b1120', border: '1px solid #1e293b', borderRadius: '4px', padding: '8px 9px', fontSize: '10px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontVariantNumeric: 'tabular-nums', color: '#cbd5e1', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>Start Vol:</span>
+                            <span>{Math.round(ca.startVol).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>− Outbound (bank):</span>
+                            <span style={{ color: '#f59e0b' }}>−{Math.round(ca.outboundRemovedM3).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>+ Inbound (bulked):</span>
+                            <span style={{ color: '#22c55e' }}>+{Math.round(ca.inboundDepositedM3).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid #1e293b', paddingTop: '3px', fontWeight: 700, color: '#f8fafc' }}>
+                            <span>= End Vol:</span>
+                            <span>{Math.round(ca.endVol).toLocaleString()} m³</span>
+                          </div>
+                          {singleSelectedNode.type !== 'external' && singleSelectedNode.type !== 'null' && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '2px' }}>
+                              <span style={{ color: '#94a3b8' }}>Headroom ({ca.sameDayCreditApplied ? 'incl. drain' : 'start-only'}):</span>
+                              <span>{Math.round(ca.effectiveHeadroomM3).toLocaleString()} m³</span>
+                            </div>
+                          )}
+                          {ca.overflowTransferredOutM3 > 0 && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                              <span style={{ color: '#94a3b8' }}>Overflow Out:</span>
+                              <span style={{ color: '#c084fc' }}>{Math.round(ca.overflowTransferredOutM3).toLocaleString()} m³</span>
+                            </div>
+                          )}
+                          {ca.headroomHoldLatched && (
+                            <div style={{ color: '#fde68a', marginTop: '2px' }}>
+                              Headroom Hold Latched
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })()}
@@ -539,6 +730,12 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   )}
                 </div>
                 <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#f8fafc' }}>{source?.name ?? 'Source'} → {target?.name ?? 'Target'}</div>
+                {selectedLink.notes && (
+                  <div style={{ padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
+                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>DESCRIPTION</div>
+                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedLink.notes}</div>
+                  </div>
+                )}
 
                 <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 8px', borderRadius: '4px', backgroundColor: statusConfig.bg, border: `1px solid ${statusConfig.border}`, color: statusConfig.color, fontSize: '11px', fontWeight: 600, width: 'fit-content' }}>
                   <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: statusConfig.color }} />
@@ -575,12 +772,71 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   <span>Transfer Rate:</span>
                   <span style={{ fontWeight: 600 }}>{Math.round(linkFlow).toLocaleString()} / {Math.round(selectedLink.dailyRate).toLocaleString()} m³/d</span>
                 </div>
-                {selectedLink.notes && (
-                  <div style={{ marginTop: '2px', padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
-                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>NOTES</div>
-                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedLink.notes}</div>
-                  </div>
-                )}
+
+                {/* Per-Day Link 6-Stage Math Audit */}
+                {currentFrame?.dayAudit?.links?.[selectedLink.id] && (() => {
+                  const la = currentFrame.dayAudit.links[selectedLink.id];
+                  return (
+                    <div style={{ borderTop: '1px solid #1e293b', paddingTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <button
+                        type="button"
+                        onClick={() => setShowLinkAudit(v => !v)}
+                        style={{ alignSelf: 'flex-start', background: 'none', border: 'none', padding: 0, color: '#38bdf8', fontSize: '11px', fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        {showLinkAudit ? '▾ Hide Day Math Audit' : '▸ Show Day Math Audit'}
+                      </button>
+                      {showLinkAudit && (
+                        <div style={{ backgroundColor: '#0b1120', border: '1px solid #1e293b', borderRadius: '4px', padding: '8px 9px', fontSize: '10px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontVariantNumeric: 'tabular-nums', color: '#cbd5e1', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>Stated Rate:</span>
+                            <span>{Math.round(la.statedRate).toLocaleString()} m³/d</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>After Calendar:</span>
+                            <span>{Math.round(la.afterCalendar).toLocaleString()} m³/d</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>After Global Weather:</span>
+                            <span>{Math.round(la.afterGlobalWeather).toLocaleString()} m³/d</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>Stage 1 (Source):</span>
+                            <span>{Math.round(la.afterSourceStock).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>Stage 1.5 (Route/Cap):</span>
+                            <span>{Math.round(la.afterCorridorAndDetour).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>Stage 2 (Headroom):</span>
+                            <span>{Math.round(la.afterTargetHeadroom).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid #1e293b', paddingTop: '3px', fontWeight: 700, color: '#22c55e' }}>
+                            <span>Final Delivered:</span>
+                            <span>{Math.round(la.finalDelivered).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '2px' }}>
+                            <span style={{ color: '#94a3b8' }}>Bulking (OUT / IN):</span>
+                            <span>{la.bulkOutApplied.toFixed(2)}× / {la.bulkInApplied.toFixed(2)}×</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#94a3b8' }}>Src − / Tgt +:</span>
+                            <span>−{Math.round(la.sourceDeductedM3).toLocaleString()} / +{Math.round(la.targetDepositedM3).toLocaleString()} m³</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid #1e293b', paddingTop: '3px' }}>
+                            <span style={{ color: '#94a3b8' }}>Binding Constraint:</span>
+                            <span style={{ color: la.bindingConstraint === 'None (Full Rate)' ? '#22c55e' : '#f59e0b', fontWeight: 700 }}>{la.bindingConstraint}</span>
+                          </div>
+                          {la.partialRuleNote && (
+                            <div style={{ color: '#fde68a', lineHeight: 1.35 }}>
+                              {la.partialRuleNote}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })()}
@@ -611,6 +867,12 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               <div style={{ backgroundColor: '#0f172a', padding: '12px', borderRadius: '6px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>ROUTE CORRIDOR TELEMETRY</div>
                 <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#f8fafc' }}>{selectedCorridor.name}</div>
+                {selectedCorridor.notes && (
+                  <div style={{ padding: '8px', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '4px', border: '1px solid #334155', fontSize: '11px', color: '#cbd5e1' }}>
+                    <div style={{ fontSize: '10px', color: '#94a3b8', fontWeight: 600, marginBottom: '2px' }}>DESCRIPTION</div>
+                    <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.4 }}>{selectedCorridor.notes}</div>
+                  </div>
+                )}
                 <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 8px', borderRadius: '4px', backgroundColor: statusConfig.bg, border: `1px solid ${statusConfig.border}`, color: statusConfig.color, fontSize: '11px', fontWeight: 600, width: 'fit-content' }}>
                   <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: statusConfig.color }} />
                   {statusConfig.label}
@@ -705,7 +967,21 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
 
             const handleStateChange = (nextState: CalendarEventState) => {
               const updates: Partial<CalendarEvent> = { state: nextState };
-              if (nextState === 'variable' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
+              if (selectedCalendarEvent.targetType === 'global') {
+                if (nextState === 'weather_haul' || nextState === 'combined_weather') {
+                  if (selectedCalendarEvent.haulRatePct === undefined || isNaN(selectedCalendarEvent.haulRatePct)) {
+                    updates.haulRatePct = 50;
+                  }
+                }
+                if (nextState === 'weather_bulking' || nextState === 'combined_weather') {
+                  if (selectedCalendarEvent.bulkInMultiplier === undefined || isNaN(selectedCalendarEvent.bulkInMultiplier)) {
+                    updates.bulkInMultiplier = 1.15;
+                  }
+                  if (selectedCalendarEvent.bulkOutMultiplier === undefined || isNaN(selectedCalendarEvent.bulkOutMultiplier)) {
+                    updates.bulkOutMultiplier = 1.0;
+                  }
+                }
+              } else if (nextState === 'variable' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
                 updates.rateValue = targetLink ? Math.round((targetLink.dailyRate * 0.5) / 50) * 50 : 500;
               } else if (nextState === 'restricted' && (selectedCalendarEvent.rateValue === undefined || isNaN(selectedCalendarEvent.rateValue))) {
                 if (selectedCalendarEvent.targetType === 'container') {
@@ -724,12 +1000,14 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
             };
 
             const durationDays = selectedCalendarEvent.endDay - selectedCalendarEvent.startDay + 1;
+            const startDateISO = dayIndexToDateISO(projectSettings.startDate, selectedCalendarEvent.startDay);
+            const endDateISO = dayIndexToDateISO(projectSettings.startDate, selectedCalendarEvent.endDay);
 
             return (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '12px', color: '#94a3b8', backgroundColor: '#0f172a', padding: '8px 12px', borderRadius: '4px', border: '1px solid #334155' }}>
                   <span>
-                    Selected: <strong style={{ color: '#38bdf8' }}>Calendar Event</strong>
+                    Selected: <strong style={{ color: '#38bdf8' }}>{selectedCalendarEvent.targetType === 'global' ? 'Global Event' : 'Calendar Event'}</strong>
                   </span>
                   <span style={{ fontSize: '10px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontVariantNumeric: 'tabular-nums', color: '#cbd5e1' }}>
                     {durationDays}d
@@ -742,22 +1020,24 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: '#94a3b8' }}>
                       {info.typeLabel}
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => onSelectTargetElement(selectedCalendarEvent.targetType, selectedCalendarEvent.targetId)}
-                      style={{
-                        background: 'none',
-                        border: '1px solid #475569',
-                        borderRadius: '4px',
-                        color: '#38bdf8',
-                        fontSize: '10px',
-                        fontWeight: 600,
-                        padding: '2px 7px',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Select on Canvas
-                    </button>
+                    {selectedCalendarEvent.targetType !== 'global' && (
+                      <button
+                        type="button"
+                        onClick={() => onSelectTargetElement(selectedCalendarEvent.targetType, selectedCalendarEvent.targetId)}
+                        style={{
+                          background: 'none',
+                          border: '1px solid #475569',
+                          borderRadius: '4px',
+                          color: '#38bdf8',
+                          fontSize: '10px',
+                          fontWeight: 600,
+                          padding: '2px 7px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Select on Canvas
+                      </button>
+                    )}
                   </div>
                   <div style={{ fontSize: '13px', fontWeight: 700, color: '#f8fafc', wordBreak: 'break-word' }}>
                     {info.name}
@@ -769,14 +1049,75 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   )}
                 </div>
 
-                {/* Start / End Day Controls */}
+                {/* Event Description (kept at top right underneath element name) */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Description</label>
+                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                  </div>
+                  <textarea
+                    value={selectedCalendarEvent.notes || ''}
+                    onChange={e => onUpdateCalendarEvent(selectedCalendarEvent.id, { notes: e.target.value })}
+                    placeholder="Scheduling reason, weather forecast, permit window, traffic restriction details..."
+                    rows={3}
+                    style={{
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #475569',
+                      borderRadius: '4px',
+                      color: '#f8fafc',
+                      padding: '8px',
+                      fontSize: '12px',
+                      resize: 'vertical',
+                      fontFamily: 'inherit',
+                      lineHeight: 1.4
+                    }}
+                  />
+                </div>
+
+                {/* Start / End Date Controls */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Start Day (1–30)</label>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Start Date</label>
+                    <input
+                      type="date"
+                      min={projectSettings.startDate}
+                      max={projectSettings.endDate}
+                      value={startDateISO}
+                      onChange={e => {
+                        if (!e.target.value) return;
+                        const dayIdx = dateISOToDayIndex(projectSettings.startDate, e.target.value, totalDays);
+                        const clamped = getClampedDayRange(selectedCalendarEvent, dayIdx, Math.max(dayIdx, selectedCalendarEvent.endDay));
+                        onUpdateCalendarEvent(selectedCalendarEvent.id, clamped);
+                      }}
+                      style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '7px', fontSize: '11px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', colorScheme: 'dark' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>End Date</label>
+                    <input
+                      type="date"
+                      min={projectSettings.startDate}
+                      max={projectSettings.endDate}
+                      value={endDateISO}
+                      onChange={e => {
+                        if (!e.target.value) return;
+                        const dayIdx = dateISOToDayIndex(projectSettings.startDate, e.target.value, totalDays);
+                        const clamped = getClampedDayRange(selectedCalendarEvent, Math.min(selectedCalendarEvent.startDay, dayIdx), dayIdx);
+                        onUpdateCalendarEvent(selectedCalendarEvent.id, clamped);
+                      }}
+                      style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '7px', fontSize: '11px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', colorScheme: 'dark' }}
+                    />
+                  </div>
+                </div>
+
+                {/* Start / End Day Index Controls */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Start Day (1–{totalDays})</label>
                     <input
                       type="number"
                       min={1}
-                      max={30}
+                      max={totalDays}
                       value={selectedCalendarEvent.startDay}
                       onChange={e => {
                         const raw = Number(e.target.value);
@@ -788,11 +1129,11 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     />
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>End Day (1–30)</label>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>End Day (1–{totalDays})</label>
                     <input
                       type="number"
                       min={1}
-                      max={30}
+                      max={totalDays}
                       value={selectedCalendarEvent.endDay}
                       onChange={e => {
                         const raw = Number(e.target.value);
@@ -807,12 +1148,22 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
 
                 {/* Event State Control */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Scheduled State</label>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>
+                    {selectedCalendarEvent.targetType === 'global' ? 'Global Event Type' : 'Scheduled State'}
+                  </label>
                   <select
                     value={selectedCalendarEvent.state}
                     onChange={e => handleStateChange(e.target.value as CalendarEventState)}
                     style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px', fontWeight: 600 }}
                   >
+                    {selectedCalendarEvent.targetType === 'global' && (
+                      <>
+                        <option value="site_shutdown">Site Shutdown (0% Movement)</option>
+                        <option value="weather_haul">Weather — Haul Movement Impact (%)</option>
+                        <option value="weather_bulking">Weather — Bulking Modifier (IN / OUT)</option>
+                        <option value="combined_weather">Combined Weather (Haul % + Bulking)</option>
+                      </>
+                    )}
                     {selectedCalendarEvent.targetType === 'container' && (
                       <>
                         <option value="open">Open (Normal Inbound & Outbound)</option>
@@ -837,6 +1188,113 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   </select>
                 </div>
 
+                {/* Global Haul Rate Modifier */}
+                {selectedCalendarEvent.targetType === 'global' &&
+                  (selectedCalendarEvent.state === 'weather_haul' || selectedCalendarEvent.state === 'combined_weather') && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>
+                        Site-Wide Haul Movement Rate (% of stated rate)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={200}
+                        step={5}
+                        value={selectedCalendarEvent.haulRatePct ?? 50}
+                        onChange={e =>
+                          onUpdateCalendarEvent(selectedCalendarEvent.id, {
+                            haulRatePct: Math.max(0, Math.min(200, Number(e.target.value) || 0))
+                          })
+                        }
+                        style={{ backgroundColor: '#0f172a', border: '1px solid #f59e0b', borderRadius: '4px', color: '#fde68a', padding: '8px', fontSize: '12px', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}
+                      />
+                    </div>
+                  )}
+
+                {/* Global Bulking Multipliers + Material Scope */}
+                {selectedCalendarEvent.targetType === 'global' &&
+                  (selectedCalendarEvent.state === 'weather_bulking' || selectedCalendarEvent.state === 'combined_weather') && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Bulk IN Mult (×)</label>
+                          <input
+                            type="number"
+                            min={0.5}
+                            max={2.5}
+                            step={0.05}
+                            value={selectedCalendarEvent.bulkInMultiplier ?? 1.0}
+                            onChange={e =>
+                              onUpdateCalendarEvent(selectedCalendarEvent.id, {
+                                bulkInMultiplier: Math.max(0.5, Math.min(2.5, Number(e.target.value) || 1))
+                              })
+                            }
+                            style={{ backgroundColor: '#0f172a', border: '1px solid #818cf8', borderRadius: '4px', color: '#e0e7ff', padding: '8px', fontSize: '12px', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}
+                          />
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Bulk OUT Mult (×)</label>
+                          <input
+                            type="number"
+                            min={0.5}
+                            max={2.5}
+                            step={0.05}
+                            value={selectedCalendarEvent.bulkOutMultiplier ?? 1.0}
+                            onChange={e =>
+                              onUpdateCalendarEvent(selectedCalendarEvent.id, {
+                                bulkOutMultiplier: Math.max(0.5, Math.min(2.5, Number(e.target.value) || 1))
+                              })
+                            }
+                            style={{ backgroundColor: '#0f172a', border: '1px solid #818cf8', borderRadius: '4px', color: '#e0e7ff', padding: '8px', fontSize: '12px', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}
+                          />
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        <label style={{ fontSize: '10px', color: '#94a3b8' }}>
+                          Affected Materials (none selected = all materials)
+                        </label>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                          {materials.map(mat => {
+                            const currentList = selectedCalendarEvent.affectedMaterials || [];
+                            const checked = currentList.includes(mat.code);
+                            return (
+                              <label
+                                key={mat.code}
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '5px',
+                                  fontSize: '11px',
+                                  color: checked ? '#f8fafc' : '#94a3b8',
+                                  cursor: 'pointer',
+                                  padding: '3px 7px',
+                                  borderRadius: '4px',
+                                  backgroundColor: '#0f172a',
+                                  border: `1px solid ${checked ? '#818cf8' : '#334155'}`
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => {
+                                    const next = checked
+                                      ? currentList.filter(c => c !== mat.code)
+                                      : [...currentList, mat.code];
+                                    onUpdateCalendarEvent(selectedCalendarEvent.id, {
+                                      affectedMaterials: next.length > 0 ? next : undefined
+                                    });
+                                  }}
+                                  style={{ accentColor: '#818cf8' }}
+                                />
+                                <span>{mat.code}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                 {/* Conditional Rate Value input */}
                 {((selectedCalendarEvent.targetType === 'transfer' && selectedCalendarEvent.state === 'variable') ||
                   (selectedCalendarEvent.targetType === 'container' && selectedCalendarEvent.state === 'restricted') ||
@@ -859,9 +1317,9 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     />
                     <div style={{ fontSize: '10px', color: '#94a3b8', lineHeight: 1.4 }}>
                       {selectedCalendarEvent.targetType === 'route'
-                        ? 'Splits this combined daily rate cap by priority (pro-rata within ties) across all active transfers assigned to this route.'
+                        ? 'Splits this combined daily rate cap using the configured Allocation Policy across all active transfers assigned to this route.'
                         : selectedCalendarEvent.targetType === 'container'
-                        ? 'Caps combined inbound & outbound transfer throughput through this container by priority (pro-rata within ties).'
+                        ? 'Caps combined inbound & outbound transfer throughput through this container using the configured Allocation Policy.'
                         : targetLink
                         ? `Overrides stated rate of ${Math.round(targetLink.dailyRate).toLocaleString()} m³/d during Day ${selectedCalendarEvent.startDay}–${selectedCalendarEvent.endDay}.`
                         : 'Overrides daily transfer rate during this window.'}
@@ -876,33 +1334,8 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     type="text"
                     value={selectedCalendarEvent.label || ''}
                     onChange={e => onUpdateCalendarEvent(selectedCalendarEvent.id, { label: e.target.value })}
-                    placeholder="e.g. Plant Service, Rain Delay, Night Shift..."
+                    placeholder="e.g. Heavy Rain, Plant Service, Safety Stand-Down..."
                     style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
-                  />
-                </div>
-
-                {/* Event Notes */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
-                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
-                  </div>
-                  <textarea
-                    value={selectedCalendarEvent.notes || ''}
-                    onChange={e => onUpdateCalendarEvent(selectedCalendarEvent.id, { notes: e.target.value })}
-                    placeholder="Scheduling reason, permit window, traffic restriction details..."
-                    rows={3}
-                    style={{
-                      backgroundColor: '#0f172a',
-                      border: '1px solid #475569',
-                      borderRadius: '4px',
-                      color: '#f8fafc',
-                      padding: '8px',
-                      fontSize: '12px',
-                      resize: 'vertical',
-                      fontFamily: 'inherit',
-                      lineHeight: 1.4
-                    }}
                   />
                 </div>
 
@@ -936,6 +1369,31 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Node Name</label>
                 <input type="text" value={singleSelectedNode.name} onChange={e => onUpdateSingleNode('name', e.target.value)} style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }} />
+              </div>
+
+              {/* Container Description Section */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Description</label>
+                  <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                </div>
+                <textarea
+                  value={singleSelectedNode.notes || ''}
+                  onChange={e => onUpdateSingleNode('notes', e.target.value)}
+                  placeholder="Operational description, geotechnical constraints, equipment assignments..."
+                  rows={3}
+                  style={{
+                    backgroundColor: '#0f172a',
+                    border: '1px solid #475569',
+                    borderRadius: '4px',
+                    color: '#f8fafc',
+                    padding: '8px',
+                    fontSize: '12px',
+                    resize: 'vertical',
+                    fontFamily: 'inherit',
+                    lineHeight: 1.4
+                  }}
+                />
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Container Type</label>
@@ -1207,31 +1665,6 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   <option value="W">West (Left Edge)</option>
                 </select>
               </div>
-
-              {/* Container Notes Section */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
-                  <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
-                </div>
-                <textarea
-                  value={singleSelectedNode.notes || ''}
-                  onChange={e => onUpdateSingleNode('notes', e.target.value)}
-                  placeholder="Operational notes, geotechnical constraints, equipment assignments..."
-                  rows={3}
-                  style={{
-                    backgroundColor: '#0f172a',
-                    border: '1px solid #475569',
-                    borderRadius: '4px',
-                    color: '#f8fafc',
-                    padding: '8px',
-                    fontSize: '12px',
-                    resize: 'vertical',
-                    fontFamily: 'inherit',
-                    lineHeight: 1.4
-                  }}
-                />
-              </div>
             </div>
           )}
 
@@ -1318,6 +1751,31 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                       {currentRole}
                     </span>
                   )}
+                </div>
+
+                {/* Transfer Link Description Section */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Description</label>
+                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                  </div>
+                  <textarea
+                    value={selectedLink.notes || ''}
+                    onChange={e => onUpdateLink('notes', e.target.value)}
+                    placeholder="Transfer route description, corridor conditions, speed restrictions..."
+                    rows={3}
+                    style={{
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #475569',
+                      borderRadius: '4px',
+                      color: '#f8fafc',
+                      padding: '8px',
+                      fontSize: '12px',
+                      resize: 'vertical',
+                      fontFamily: 'inherit',
+                      lineHeight: 1.4
+                    }}
+                  />
                 </div>
 
                 {/* Link Role Selector */}
@@ -1694,31 +2152,6 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                     )}
                   </div>
                 )}
-
-                {/* Transfer Link Notes Section */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
-                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
-                  </div>
-                  <textarea
-                    value={selectedLink.notes || ''}
-                    onChange={e => onUpdateLink('notes', e.target.value)}
-                    placeholder="Transfer route notes, corridor conditions, speed restrictions..."
-                    rows={3}
-                    style={{
-                      backgroundColor: '#0f172a',
-                      border: '1px solid #475569',
-                      borderRadius: '4px',
-                      color: '#f8fafc',
-                      padding: '8px',
-                      fontSize: '12px',
-                      resize: 'vertical',
-                      fontFamily: 'inherit',
-                      lineHeight: 1.4
-                    }}
-                  />
-                </div>
               </div>
             );
           })()}
@@ -1736,6 +2169,31 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                   value={selectedCorridor.name}
                   onChange={e => onUpdateCorridor('name', e.target.value)}
                   style={{ backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '4px', color: '#f8fafc', padding: '8px', fontSize: '12px' }}
+                />
+              </div>
+
+              {/* Corridor Description Section */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Description</label>
+                  <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
+                </div>
+                <textarea
+                  value={selectedCorridor.notes || ''}
+                  onChange={e => onUpdateCorridor('notes', e.target.value)}
+                  placeholder="Route corridor grade, surface type, width constraints..."
+                  rows={3}
+                  style={{
+                    backgroundColor: '#0f172a',
+                    border: '1px solid #475569',
+                    borderRadius: '4px',
+                    color: '#f8fafc',
+                    padding: '8px',
+                    fontSize: '12px',
+                    resize: 'vertical',
+                    fontFamily: 'inherit',
+                    lineHeight: 1.4
+                  }}
                 />
               </div>
 
@@ -1852,30 +2310,6 @@ export const PropertyInspector: React.FC<PropertyInspectorProps> = ({
                       })}
                     </div>
                   )}
-                </div>
-
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <label style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>Notes</label>
-                    <span style={{ fontSize: '10px', color: '#64748b' }}>Included in CSV export</span>
-                  </div>
-                  <textarea
-                    value={selectedCorridor.notes || ''}
-                    onChange={e => onUpdateCorridor('notes', e.target.value)}
-                    placeholder="Route corridor grade, surface type, width constraints..."
-                    rows={3}
-                    style={{
-                      backgroundColor: '#0f172a',
-                      border: '1px solid #475569',
-                      borderRadius: '4px',
-                      color: '#f8fafc',
-                      padding: '8px',
-                      fontSize: '12px',
-                      resize: 'vertical',
-                      fontFamily: 'inherit',
-                      lineHeight: 1.4
-                    }}
-                  />
                 </div>
               </div>
             )}

@@ -6,10 +6,17 @@ import {
   CalendarModel,
   CalendarEvent,
   CalendarTargetType,
+  ProjectSettings,
   GRAPH_LINE_COLORS,
   getLinkRole,
   getLinkCorridorIds
 } from '../../models/types';
+import {
+  dayIndexToDateISO,
+  evaluateCalendarDay,
+  formatShortDate,
+  getAdaptiveGraphTicks
+} from '../../utils/dateUtils';
 
 export const TIMELINE_THUMB_INSET = 8.5;
 
@@ -18,6 +25,7 @@ interface CalendarGanttProps {
   links: TransferLink[];
   corridors: RouteCorridor[];
   calendar: CalendarModel;
+  projectSettings: ProjectSettings;
   totalDays: number;
   currentDay: number;
   isPlayback: boolean;
@@ -98,6 +106,49 @@ export const getCalendarEventVisual = (
   label: string;
   semantic: 'red' | 'amber' | 'green';
 } => {
+  if (evt.targetType === 'global') {
+    if (evt.state === 'site_shutdown') {
+      return {
+        bg: 'rgba(239, 68, 68, 0.28)',
+        border: '#ef4444',
+        text: '#fecaca',
+        label: evt.label?.trim() || 'SITE SHUTDOWN',
+        semantic: 'red'
+      };
+    }
+    if (evt.state === 'weather_bulking') {
+      const bIn = evt.bulkInMultiplier ?? 1;
+      const bOut = evt.bulkOutMultiplier ?? 1;
+      const defaultLbl = bIn !== 1 ? `BULK IN ×${bIn.toFixed(2)}` : `BULK OUT ×${bOut.toFixed(2)}`;
+      return {
+        bg: 'rgba(129, 140, 248, 0.26)',
+        border: '#818cf8',
+        text: '#e0e7ff',
+        label: evt.label?.trim() || defaultLbl,
+        semantic: 'amber'
+      };
+    }
+    if (evt.state === 'combined_weather') {
+      const pct = Math.round(evt.haulRatePct ?? 50);
+      return {
+        bg: 'rgba(56, 189, 248, 0.24)',
+        border: '#38bdf8',
+        text: '#e0f2fe',
+        label: evt.label?.trim() || `WX ${pct}% · BULK`,
+        semantic: pct <= 0 ? 'red' : 'amber'
+      };
+    }
+    // weather_haul
+    const pct = Math.round(evt.haulRatePct ?? 50);
+    return {
+      bg: pct <= 0 ? 'rgba(239, 68, 68, 0.26)' : 'rgba(245, 158, 11, 0.26)',
+      border: pct <= 0 ? '#ef4444' : '#f59e0b',
+      text: pct <= 0 ? '#fecaca' : '#fde68a',
+      label: evt.label?.trim() || `HAUL ${pct}%`,
+      semantic: pct <= 0 ? 'red' : pct >= 100 ? 'green' : 'amber'
+    };
+  }
+
   if (evt.targetType === 'container') {
     if (evt.state === 'blocked') {
       return {
@@ -227,6 +278,7 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
   links,
   corridors,
   calendar,
+  projectSettings,
   totalDays,
   currentDay,
   isPlayback,
@@ -245,6 +297,7 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
   const headerTrackRef = useRef<HTMLDivElement>(null);
   const [trackWidth, setTrackWidth] = useState<number>(800);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<CalendarTargetType, boolean>>({
+    global: false,
     container: false,
     transfer: false,
     route: false
@@ -399,7 +452,18 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
       if (cur.mode === 'draw') {
         const id = `cal-evt-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
         let newEventInput: Omit<CalendarEvent, 'calendarId'>;
-        if (cur.targetType === 'container') {
+        if (cur.targetType === 'global') {
+          newEventInput = {
+            id,
+            targetType: 'global',
+            targetId: 'site',
+            startDay: cur.startDay,
+            endDay: cur.endDay,
+            state: 'weather_haul',
+            haulRatePct: 50,
+            label: 'Weather Impact'
+          };
+        } else if (cur.targetType === 'container') {
           newEventInput = {
             id,
             targetType: 'container',
@@ -549,18 +613,43 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
   const currentX = dayToCenterX(currentDay);
   const day0BandWidth = Math.max(0, dayToCenterX(0) + dayStep * 0.48);
 
-  const majorTicks = useMemo(() => {
-    const arr: number[] = [];
-    for (let d = 0; d <= totalDays; d += 5) arr.push(d);
-    if (arr[arr.length - 1] !== totalDays) arr.push(totalDays);
-    return arr;
-  }, [totalDays]);
+  const majorTicks = useMemo(() => getAdaptiveGraphTicks(totalDays), [totalDays]);
 
-  const allDayTicks = useMemo(() => {
+  const minorGridDays = useMemo(() => {
     const arr: number[] = [];
-    for (let d = 0; d <= totalDays; d++) arr.push(d);
+    if (totalDays <= 65) {
+      for (let d = 1; d <= totalDays; d++) arr.push(d);
+    } else {
+      for (const t of majorTicks) {
+        if (t > 0) arr.push(t);
+      }
+    }
     return arr;
-  }, [totalDays]);
+  }, [totalDays, majorTicks]);
+
+  const nonWorkingBands = useMemo(() => {
+    const bands: Array<{ startDay: number; endDay: number; isHoliday: boolean }> = [];
+    let current: { startDay: number; endDay: number; isHoliday: boolean } | null = null;
+    for (let d = 1; d <= totalDays; d++) {
+      const cal = evaluateCalendarDay(projectSettings, d);
+      if (!cal.isWorkingDay) {
+        const isHoliday = Boolean(cal.holiday);
+        if (current && current.endDay === d - 1 && current.isHoliday === isHoliday) {
+          current.endDay = d;
+        } else {
+          if (current) bands.push(current);
+          current = { startDay: d, endDay: d, isHoliday };
+        }
+      } else if (current) {
+        bands.push(current);
+        current = null;
+      }
+    }
+    if (current) bands.push(current);
+    return bands;
+  }, [totalDays, projectSettings]);
+
+  const majorTickSet = useMemo(() => new Set(majorTicks), [majorTicks]);
 
   const renderTrackGridLines = () => (
     <>
@@ -577,11 +666,32 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
           pointerEvents: 'none'
         }}
       />
+      {/* Non-working weekend & holiday bands */}
+      {nonWorkingBands.map((band, i) => {
+        const left = Math.max(0, dayToCenterX(band.startDay) - dayStep * 0.5);
+        const right = Math.min(trackWidth, dayToCenterX(band.endDay) + dayStep * 0.5);
+        const w = Math.max(1.5, right - left);
+        return (
+          <div
+            key={`nw-${i}`}
+            style={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              left: `${left}px`,
+              width: `${w}px`,
+              backgroundColor: band.isHoliday
+                ? 'rgba(239, 68, 68, 0.08)'
+                : 'rgba(148, 163, 184, 0.07)',
+              pointerEvents: 'none'
+            }}
+          />
+        );
+      })}
       {/* Vertical day gridlines */}
-      {allDayTicks.map(d => {
-        if (d === 0) return null;
+      {minorGridDays.map(d => {
         const x = dayToCenterX(d) - dayStep * 0.5;
-        const isMajor = d % 5 === 0;
+        const isMajor = majorTickSet.has(d);
         return (
           <div
             key={d}
@@ -757,13 +867,20 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
                 drag &&
                 drag.mode !== 'draw' &&
                 drag.eventId === evt.id;
-              const displayStart = isDraggedEvt ? drag.currentStartDay : evt.startDay;
-              const displayEnd = isDraggedEvt ? drag.currentEndDay : evt.endDay;
+              const rawStart = isDraggedEvt ? drag.currentStartDay : evt.startDay;
+              const rawEnd = isDraggedEvt ? drag.currentEndDay : evt.endDay;
+              if (rawStart > totalDays) return null;
+              const displayStart = Math.max(1, Math.min(totalDays, rawStart));
+              const displayEnd = Math.max(displayStart, Math.min(totalDays, rawEnd));
               const { left, width } = getBarPixelBounds(displayStart, displayEnd);
               const vis = getCalendarEventVisual(evt, link);
               const isSelected = selectedCalendarEventId === evt.id;
+              const startShort = formatShortDate(dayIndexToDateISO(projectSettings.startDate, displayStart));
+              const endShort = formatShortDate(dayIndexToDateISO(projectSettings.startDate, displayEnd));
               const dayRangeText =
-                displayStart === displayEnd ? `D${displayStart}` : `D${displayStart}–D${displayEnd}`;
+                displayStart === displayEnd
+                  ? `D${displayStart} (${startShort})`
+                  : `D${displayStart}–D${displayEnd} (${startShort}–${endShort})`;
 
               return (
                 <div
@@ -788,7 +905,7 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
                     zIndex: isSelected ? 5 : 4,
                     overflow: 'hidden'
                   }}
-                  title={`${title} · ${vis.label} (${dayRangeText})${isPlayback ? '' : ' — Drag to move, drag edges to resize, click to edit in inspector'}`}
+                  title={`${title} · ${vis.label} · ${dayRangeText}${isPlayback ? '' : ' — Drag to move, drag edges to resize, click to edit in inspector'}`}
                 >
                   {/* Left resize handle */}
                   {!isPlayback && (
@@ -1087,6 +1204,10 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
             {majorTicks.map(d => {
               const x = dayToCenterX(d);
               const translate = d === 0 ? '0%' : d === totalDays ? '-100%' : '-50%';
+              const tickLabel =
+                d === 0
+                  ? 'D0'
+                  : formatShortDate(dayIndexToDateISO(projectSettings.startDate, d));
               return (
                 <span
                   key={d}
@@ -1103,7 +1224,7 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
                     whiteSpace: 'nowrap'
                   }}
                 >
-                  D{d}
+                  {tickLabel}
                 </span>
               );
             })}
@@ -1121,6 +1242,26 @@ export const CalendarGantt: React.FC<CalendarGanttProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Group 0: Global / Site Events */}
+      {(() => {
+        const globalEventsCount = (eventsByRow.get('global:site') || []).length;
+        const workingDaysPerWeek = projectSettings.workingDays.filter(Boolean).length;
+        return (
+          <>
+            {renderGroupHeader('global', 'Global / Site Events', globalEventsCount)}
+            {!collapsedGroups.global &&
+              renderRow(
+                'global',
+                'site',
+                'Site-Wide / Weather',
+                `${workingDaysPerWeek}d/wk`,
+                '#38bdf8',
+                false
+              )}
+          </>
+        );
+      })()}
 
       {/* Group 1: Containers */}
       {renderGroupHeader('container', 'Containers', nodes.length)}

@@ -8,6 +8,7 @@ import { PropertyInspector } from './components/inspector/PropertyInspector';
 import { ExportModal } from './components/modal/ExportModal';
 import { RuleConfirmModal } from './components/modal/RuleConfirmModal';
 import { ManualModal } from './components/modal/ManualModal';
+import { SettingsDrawer } from './components/settings/SettingsDrawer';
 import {
   CardinalEdge,
   ContainerNode,
@@ -26,9 +27,16 @@ import {
   ClipboardData,
   ContainerProperties,
   LinkProperties,
+  ProjectSettings,
+  ProjectHoliday,
+  SimSettings,
+  SettingsPresetPayload,
+  normalizeProjectSettings,
+  normalizeSimSettings,
   getLinkCorridorIds,
   getLinkBackupCorridorIds
 } from './models/types';
+import { formatShortDate } from './utils/dateUtils';
 import { getEffectiveContainerOutputEdge, getEffectiveContainerInputEdge, computeBestFitCorridorWaypoints } from './components/canvas/pipeRouter';
 
 export default function App() {
@@ -38,6 +46,9 @@ export default function App() {
   const [corridors, setCorridors] = useState(vm.getCorridors());
   const [calendar, setCalendar] = useState<CalendarModel>(() => vm.getCalendar());
   const [materials, setMaterials] = useState(vm.getMaterials());
+  const [projectSettings, setProjectSettings] = useState<ProjectSettings>(() => vm.getProjectSettings());
+  const [simSettings, setSimSettings] = useState<SimSettings>(() => vm.getSimSettings());
+  const [isSettingsDrawerOpen, setIsSettingsDrawerOpen] = useState<boolean>(false);
   
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(['node-1']);
   const [selectedLinkIds, setSelectedLinkIds] = useState<string[]>([]);
@@ -61,6 +72,57 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const currentFrame = vm.getCurrentFrame();
   const frames = vm.getFrames();
+  const totalDays = vm.getTotalDays();
+
+  const handleUpdateProjectSettings = useCallback((updates: Partial<ProjectSettings>) => {
+    const next = vm.updateProjectSettings(updates);
+    setProjectSettings(next);
+    const nextMaxDay = vm.getTotalDays();
+    setCurrentDay(prev => {
+      const clamped = Math.min(prev, nextMaxDay);
+      vm.setFrameIndex(clamped);
+      return clamped;
+    });
+  }, [vm]);
+
+  const handleResetProjectSettings = useCallback(() => {
+    const next = vm.resetProjectSettings();
+    setProjectSettings(next);
+    const nextMaxDay = vm.getTotalDays();
+    setCurrentDay(prev => {
+      const clamped = Math.min(prev, nextMaxDay);
+      vm.setFrameIndex(clamped);
+      return clamped;
+    });
+  }, [vm]);
+
+  const handleUpdateSimSettings = useCallback((updates: Partial<SimSettings>) => {
+    const next = vm.updateSimSettings(updates);
+    setSimSettings(next);
+  }, [vm]);
+
+  const handleResetSimSettings = useCallback(() => {
+    const next = vm.resetSimSettings();
+    setSimSettings(next);
+  }, [vm]);
+
+  const handleImportSettingsPreset = useCallback((preset: SettingsPresetPayload) => {
+    const res = vm.applySettingsPreset(preset);
+    setProjectSettings(vm.getProjectSettings());
+    setSimSettings(vm.getSimSettings());
+    setCalendar(vm.getCalendar());
+    const nextMaxDay = vm.getTotalDays();
+    setCurrentDay(prev => {
+      const clamped = Math.min(prev, nextMaxDay);
+      vm.setFrameIndex(clamped);
+      return clamped;
+    });
+    const parts: string[] = [];
+    if (res.appliedProject) parts.push('Project Settings');
+    if (res.appliedSim) parts.push('Sim Settings');
+    if (res.appliedGlobalEvents > 0) parts.push(`${res.appliedGlobalEvents} Global Event${res.appliedGlobalEvents > 1 ? 's' : ''}`);
+    showToast(`Imported preset: ${parts.join(', ') || 'settings'}.`, 'success');
+  }, [vm]);
 
   const togglePlayback = () => {
     const nextState = !isPlayback;
@@ -159,7 +221,11 @@ export default function App() {
           materialType: materials[0]?.code || 'TYPE1',
           plantCount: 2,
           overflowMode: 'strict',
-          strictSubRule: 'throttleback'
+          strictSubRule: 'throttleback',
+          headroomThreshold: simSettings.defaultHeadroomThresholdM3,
+          ...(simSettings.defaultOverflowTriggerPct < 100
+            ? { overflowTriggerPct: simSettings.defaultOverflowTriggerPct }
+            : {})
         };
 
     vm.addNode(newNode);
@@ -338,6 +404,10 @@ export default function App() {
 
   const handleSelectTargetElement = useCallback((targetType: CalendarTargetType, targetId: string) => {
     setSelectedCalendarEventId(null);
+    if (targetType === 'global') {
+      setIsSettingsDrawerOpen(true);
+      return;
+    }
     if (targetType === 'container') {
       setSelectedNodeIds([targetId]);
       setSelectedLinkIds([]);
@@ -435,15 +505,33 @@ export default function App() {
         const parsedCorridors: RouteCorridor[] = [];
         let parsedCalendarMeta: { id: string; name: string; notes?: string } | null = null;
         const parsedCalendarEvents: CalendarEvent[] = [];
+        const parsedProjectKV: Record<string, string> = {};
+        const parsedHolidays: ProjectHoliday[] = [];
+        const parsedSimKV: Record<string, string> = {};
+        let hasProjectSettingsSection = false;
+        let hasSimSettingsSection = false;
         let currentSection = '';
         let nodeHeaderCols: string[] = [];
         let corridorHeaderCols: string[] = [];
         let linkHeaderCols: string[] = [];
+        let calendarEventHeaderCols: string[] = [];
 
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed) continue;
-          if (trimmed.startsWith('# SECTION: MATERIALS') || trimmed.startsWith('# SECTION: MATERIAL DEFINITIONS')) {
+          if (trimmed.startsWith('# SECTION: PROJECT SETTINGS')) {
+            currentSection = 'PROJECT_SETTINGS';
+            hasProjectSettingsSection = true;
+            continue;
+          } else if (trimmed.startsWith('# SECTION: PROJECT HOLIDAYS')) {
+            currentSection = 'PROJECT_HOLIDAYS';
+            hasProjectSettingsSection = true;
+            continue;
+          } else if (trimmed.startsWith('# SECTION: SIM SETTINGS')) {
+            currentSection = 'SIM_SETTINGS';
+            hasSimSettingsSection = true;
+            continue;
+          } else if (trimmed.startsWith('# SECTION: MATERIALS') || trimmed.startsWith('# SECTION: MATERIAL DEFINITIONS')) {
             currentSection = 'MATERIALS';
             continue;
           } else if (trimmed.startsWith('# SECTION: INITIAL MODEL NODES') || trimmed.startsWith('# SECTION: NODES')) {
@@ -460,6 +548,7 @@ export default function App() {
             continue;
           } else if (trimmed.startsWith('# SECTION: CALENDAR EVENTS')) {
             currentSection = 'CALENDAR_EVENTS';
+            calendarEventHeaderCols = [];
             continue;
           } else if (trimmed.startsWith('# SECTION: CALENDAR')) {
             currentSection = 'CALENDAR';
@@ -483,16 +572,52 @@ export default function App() {
             linkHeaderCols = trimmed.split(',').map(c => c.trim().toLowerCase().replace(/^"|"$/g, ''));
             continue; // Header row
           }
+          if (trimmed.toLowerCase().startsWith('eventid,')) {
+            calendarEventHeaderCols = trimmed.split(',').map(c => c.trim().toLowerCase().replace(/^"|"$/g, ''));
+            continue; // Header row
+          }
           if (
+            trimmed.toLowerCase().startsWith('key,value') ||
+            trimmed.toLowerCase().startsWith('holidayid,') ||
             trimmed.toLowerCase().startsWith('calendarid,') ||
-            trimmed.toLowerCase().startsWith('eventid,') ||
             trimmed.toLowerCase().startsWith('code,') ||
             trimmed.toLowerCase().startsWith('day,')
           ) {
             continue; // Header row
           }
 
-          if (currentSection === 'MATERIALS') {
+          if (currentSection === 'PROJECT_SETTINGS') {
+            const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+            if (parts.length >= 2) {
+              const key = parts[0].replace(/^"|"$/g, '').trim();
+              const val = parts[1].replace(/^"|"$/g, '').replace(/""/g, '"').trim();
+              if (key) parsedProjectKV[key] = val;
+            }
+          } else if (currentSection === 'PROJECT_HOLIDAYS') {
+            const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+            if (parts.length >= 2) {
+              const id = parts[0].replace(/^"|"$/g, '').trim() || `hol-${parsedHolidays.length + 1}`;
+              const startDate = parts[1].replace(/^"|"$/g, '').trim();
+              const rawEnd = parts[2] ? parts[2].replace(/^"|"$/g, '').trim() : '';
+              const endDate = rawEnd || startDate;
+              const name = parts[3] ? parts[3].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : 'Holiday';
+              if (startDate) {
+                parsedHolidays.push({
+                  id,
+                  startDate,
+                  endDate,
+                  name
+                });
+              }
+            }
+          } else if (currentSection === 'SIM_SETTINGS') {
+            const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+            if (parts.length >= 2) {
+              const key = parts[0].replace(/^"|"$/g, '').trim();
+              const val = parts[1].replace(/^"|"$/g, '').replace(/""/g, '"').trim();
+              if (key) parsedSimKV[key] = val;
+            }
+          } else if (currentSection === 'MATERIALS') {
             // Format: Code,Name,BulkIN,BulkOUT
             const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
             if (parts.length >= 4) {
@@ -749,7 +874,7 @@ export default function App() {
               parsedCalendarMeta = { id, name, notes: notes || undefined };
             }
           } else if (currentSection === 'CALENDAR_EVENTS') {
-            // Format: EventID,CalendarID,TargetType,TargetID,StartDay,EndDay,State,RateValue,Label,Notes
+            // Format: EventID,CalendarID,TargetType,TargetID,StartDay,EndDay,State,RateValue,Label,Notes,[HaulRatePct],[BulkInMult],[BulkOutMult],[AffectedMaterials]
             const parts = trimmed.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
             if (parts.length >= 7) {
               const id = parts[0].replace(/^"|"$/g, '').trim();
@@ -764,8 +889,27 @@ export default function App() {
               const label = parts[8] ? parts[8].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : undefined;
               const notes = parts[9] ? parts[9].replace(/^"|"$/g, '').replace(/""/g, '"').trim() : undefined;
 
-              const validTargetTypes: CalendarTargetType[] = ['container', 'transfer', 'route'];
+              const haulIdx = calendarEventHeaderCols.indexOf('haulratepct');
+              const rawHaul = (haulIdx !== -1 ? parts[haulIdx] : parts[10])?.replace(/^"|"$/g, '').trim() ?? '';
+              const haulRatePct = rawHaul !== '' && !isNaN(parseFloat(rawHaul)) ? parseFloat(rawHaul) : undefined;
+
+              const bulkInIdx = calendarEventHeaderCols.indexOf('bulkinmult');
+              const rawBulkIn = (bulkInIdx !== -1 ? parts[bulkInIdx] : parts[11])?.replace(/^"|"$/g, '').trim() ?? '';
+              const bulkInMultiplier = rawBulkIn !== '' && !isNaN(parseFloat(rawBulkIn)) ? parseFloat(rawBulkIn) : undefined;
+
+              const bulkOutIdx = calendarEventHeaderCols.indexOf('bulkoutmult');
+              const rawBulkOut = (bulkOutIdx !== -1 ? parts[bulkOutIdx] : parts[12])?.replace(/^"|"$/g, '').trim() ?? '';
+              const bulkOutMultiplier = rawBulkOut !== '' && !isNaN(parseFloat(rawBulkOut)) ? parseFloat(rawBulkOut) : undefined;
+
+              const affectedIdx = calendarEventHeaderCols.indexOf('affectedmaterials');
+              const rawAffected = (affectedIdx !== -1 ? parts[affectedIdx] : parts[13])?.replace(/^"|"$/g, '').trim() ?? '';
+              const affectedList = rawAffected
+                ? Array.from(new Set(rawAffected.split('|').map(s => s.trim().toUpperCase()).filter(Boolean)))
+                : [];
+
+              const validTargetTypes: CalendarTargetType[] = ['global', 'container', 'transfer', 'route'];
               const validStatesByType: Record<CalendarTargetType, CalendarEventState[]> = {
+                global: ['site_shutdown', 'weather_haul', 'weather_bulking', 'combined_weather'],
                 container: ['open', 'restricted', 'blocked'],
                 transfer: ['max', 'variable', 'stopped'],
                 route: ['open', 'restricted', 'blocked']
@@ -773,7 +917,7 @@ export default function App() {
 
               if (
                 id &&
-                targetId &&
+                (targetId || rawTargetType === 'global') &&
                 validTargetTypes.includes(rawTargetType as CalendarTargetType) &&
                 !isNaN(startDay) &&
                 !isNaN(endDay) &&
@@ -783,11 +927,15 @@ export default function App() {
                   id,
                   calendarId,
                   targetType: rawTargetType as CalendarTargetType,
-                  targetId,
+                  targetId: rawTargetType === 'global' ? 'site' : targetId,
                   startDay,
                   endDay,
                   state: rawState as CalendarEventState,
                   ...(rateValue !== undefined ? { rateValue } : {}),
+                  ...(haulRatePct !== undefined ? { haulRatePct } : {}),
+                  ...(bulkInMultiplier !== undefined ? { bulkInMultiplier } : {}),
+                  ...(bulkOutMultiplier !== undefined ? { bulkOutMultiplier } : {}),
+                  ...(affectedList.length > 0 ? { affectedMaterials: affectedList } : {}),
                   ...(label ? { label } : {}),
                   ...(notes ? { notes } : {})
                 });
@@ -816,12 +964,60 @@ export default function App() {
                 }
               : undefined;
 
+          let parsedProjectSettings: ProjectSettings | undefined = undefined;
+          if (hasProjectSettingsSection) {
+            const rawWd = parsedProjectKV['WorkingDays'];
+            let workingDays: ProjectSettings['workingDays'] | undefined = undefined;
+            if (rawWd) {
+              const bits = rawWd.split('|').map(s => s.trim() === '1' || s.trim().toLowerCase() === 'true');
+              if (bits.length === 7) {
+                workingDays = bits as ProjectSettings['workingDays'];
+              }
+            }
+            parsedProjectSettings = normalizeProjectSettings({
+              projectName: parsedProjectKV['ProjectName'],
+              startDate: parsedProjectKV['StartDate'],
+              endDate: parsedProjectKV['EndDate'],
+              workingDays,
+              holidays: parsedHolidays,
+              projectNotes: parsedProjectKV['ProjectNotes']
+            });
+          }
+
+          let parsedSimSettings: SimSettings | undefined = undefined;
+          if (hasSimSettingsSection) {
+            parsedSimSettings = normalizeSimSettings({
+              allocationPolicy: parsedSimKV['AllocationPolicy'] as any,
+              partialDeliveryPolicy: parsedSimKV['PartialDeliveryPolicy'] as any,
+              truckPayloadM3: parsedSimKV['TruckPayloadM3'] ? parseFloat(parsedSimKV['TruckPayloadM3']) : undefined,
+              minBatchPct: parsedSimKV['MinBatchPct'] ? parseFloat(parsedSimKV['MinBatchPct']) : undefined,
+              sameDayDrainageCredit:
+                parsedSimKV['SameDayDrainageCredit'] !== undefined
+                  ? parsedSimKV['SameDayDrainageCredit'].toLowerCase() === 'true'
+                  : undefined,
+              bulkingMode: parsedSimKV['BulkingMode'] as any,
+              diversionOrder: parsedSimKV['DiversionOrder'] as any,
+              allowOvertimeOnNonWorkingDays:
+                parsedSimKV['AllowOvertimeOnNonWorkingDays'] !== undefined
+                  ? parsedSimKV['AllowOvertimeOnNonWorkingDays'].toLowerCase() === 'true'
+                  : undefined,
+              defaultHeadroomThresholdM3: parsedSimKV['DefaultHeadroomThresholdM3']
+                ? parseFloat(parsedSimKV['DefaultHeadroomThresholdM3'])
+                : undefined,
+              defaultOverflowTriggerPct: parsedSimKV['DefaultOverflowTriggerPct']
+                ? parseFloat(parsedSimKV['DefaultOverflowTriggerPct'])
+                : undefined
+            });
+          }
+
           vm.loadModel(
             parsedNodes,
             validParsedLinks,
             parsedMaterials.length > 0 ? parsedMaterials : undefined,
             parsedCorridors,
-            parsedCalendar
+            parsedCalendar,
+            parsedProjectSettings,
+            parsedSimSettings
           );
           // When a new model is loaded, reset timeline to day 0
           vm.setFrameIndex(0);
@@ -834,16 +1030,19 @@ export default function App() {
           setCorridors(vm.getCorridors().map(c => ({ ...c, waypoints: c.waypoints.map(p => ({ ...p })) })));
           setCalendar(vm.getCalendar());
           setMaterials([...vm.getMaterials()]);
+          setProjectSettings(vm.getProjectSettings());
+          setSimSettings(vm.getSimSettings());
           setSelectedNodeIds([parsedNodes[0].id]);
           setSelectedLinkIds([]);
           setSelectedCorridorIds([]);
           setSelectedCalendarEventId(null);
 
           const importedCalCount = vm.getCalendar().events.length;
-          const matSummary = parsedMaterials.length > 0 ? `, ${parsedMaterials.length} materials (with bulking factors)` : '';
-          const corridorSummary = parsedCorridors.length > 0 ? `, ${parsedCorridors.length} route corridors` : '';
-          const calSummary = importedCalCount > 0 ? `, ${importedCalCount} calendar event${importedCalCount > 1 ? 's' : ''}` : '';
-          showToast(`Successfully imported ${parsedNodes.length} nodes, ${validParsedLinks.length} links${corridorSummary}${calSummary}${matSummary}!`, 'success');
+          const matSummary = parsedMaterials.length > 0 ? `, ${parsedMaterials.length} materials` : '';
+          const corridorSummary = parsedCorridors.length > 0 ? `, ${parsedCorridors.length} corridors` : '';
+          const calSummary = importedCalCount > 0 ? `, ${importedCalCount} event${importedCalCount > 1 ? 's' : ''}` : '';
+          const settingsSummary = hasProjectSettingsSection || hasSimSettingsSection ? ' + project/sim settings' : '';
+          showToast(`Imported ${parsedNodes.length} nodes, ${validParsedLinks.length} links${corridorSummary}${calSummary}${matSummary}${settingsSummary}!`, 'success');
         } else {
           showToast('No valid nodes found in CSV file.', 'error');
         }
@@ -1196,6 +1395,9 @@ export default function App() {
         onTogglePlayback={togglePlayback}
         onOpenExportModal={() => setIsExportModalOpen(true)}
         onOpenManualModal={() => setIsManualModalOpen(true)}
+        isSettingsOpen={isSettingsDrawerOpen}
+        onToggleSettings={() => setIsSettingsDrawerOpen(v => !v)}
+        projectHorizonLabel={`${formatShortDate(projectSettings.startDate)} – ${formatShortDate(projectSettings.endDate)} (${totalDays}d)`}
       />
       
       <BatchPresetBar onApplyPreset={handleApplyPreset} selectedCount={selectedNodeIds.length} />
@@ -1237,6 +1439,7 @@ export default function App() {
             links={links}
             corridors={corridors}
             calendar={calendar}
+            projectSettings={projectSettings}
             frames={frames}
             currentDay={currentDay}
             isPlayback={isPlayback}
@@ -1261,6 +1464,9 @@ export default function App() {
           vm={vm}
           isPlayback={isPlayback}
           currentDay={currentDay}
+          totalDays={totalDays}
+          projectSettings={projectSettings}
+          simSettings={simSettings}
           currentFrame={currentFrame}
           selectedNodeIds={selectedNodeIds}
           selectedLinkIds={selectedLinkIds}
@@ -1299,6 +1505,37 @@ export default function App() {
         />
       </div>
 
+      <SettingsDrawer
+        isOpen={isSettingsDrawerOpen}
+        onClose={() => setIsSettingsDrawerOpen(false)}
+        isPlayback={isPlayback}
+        projectSettings={projectSettings}
+        simSettings={simSettings}
+        materials={materials}
+        calendarEvents={calendar.events}
+        onUpdateProjectSettings={handleUpdateProjectSettings}
+        onResetProjectSettings={handleResetProjectSettings}
+        onUpdateSimSettings={handleUpdateSimSettings}
+        onResetSimSettings={handleResetSimSettings}
+        onAddGlobalEvent={evt => {
+          const created = handleAddCalendarEvent(evt);
+          handleSelectCalendarEvent(created.id);
+          showToast(`Added global event "${created.label || created.state.replace(/_/g, ' ')}".`, 'success');
+        }}
+        onSelectGlobalEvent={eventId => {
+          handleSelectCalendarEvent(eventId);
+          setIsSettingsDrawerOpen(false);
+        }}
+        onDeleteGlobalEvent={eventId => {
+          vm.removeCalendarEvent(eventId);
+          setCalendar(vm.getCalendar());
+          setSelectedCalendarEventId(prev => (prev === eventId ? null : prev));
+          showToast('Removed global event.', 'success');
+        }}
+        onImportPreset={handleImportSettingsPreset}
+        onShowToast={showToast}
+      />
+
       <ExportModal
         isOpen={isExportModalOpen}
         onClose={() => setIsExportModalOpen(false)}
@@ -1306,6 +1543,8 @@ export default function App() {
         links={links}
         corridors={corridors}
         calendar={calendar}
+        projectSettings={projectSettings}
+        simSettings={simSettings}
         frames={frames}
         materials={materials}
       />
